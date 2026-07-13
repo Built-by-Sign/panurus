@@ -1189,6 +1189,13 @@ func (r *Request) SetSignatures(sigmas map[string][]byte) bool {
 		signatures = append(signatures, signature)
 	}
 
+	// Preserve auditor signatures attached before the action signatures are set.
+	for _, signature := range r.Actions.Signatures {
+		if signature != nil && signature.Auditor != nil {
+			signatures = append(signatures, signature)
+		}
+	}
+
 	r.Actions.Signatures = signatures
 
 	return all

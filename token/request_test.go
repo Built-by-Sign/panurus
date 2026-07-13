@@ -346,6 +346,27 @@ func TestRequest_AddAuditorSignature(t *testing.T) {
 	require.NotNil(t, r.Actions.Signatures[1].Auditor)
 }
 
+// TestRequest_SetSignaturesPreservesAuditorSignatures tests that SetSignatures
+// keeps auditor signatures attached before action signatures are set.
+func TestRequest_SetSignaturesPreservesAuditorSignatures(t *testing.T) {
+	r := &Request{
+		Actions:  &driver.TokenRequest{},
+		Metadata: &driver.TokenRequestMetadata{},
+	}
+
+	identity := Identity("auditor1")
+	sigma := []byte("signature1")
+	r.AddAuditorSignature(identity, sigma)
+
+	all := r.SetSignatures(map[string][]byte{})
+	assert.True(t, all)
+
+	require.Len(t, r.Actions.Signatures, 1)
+	require.NotNil(t, r.Actions.Signatures[0].Auditor)
+	assert.Equal(t, identity, r.Actions.Signatures[0].Auditor.Identity)
+	assert.Equal(t, sigma, r.Actions.Signatures[0].Auditor.Signature)
+}
+
 // TestRequest_AllApplicationMetadata tests AllApplicationMetadata
 func TestRequest_AllApplicationMetadata(t *testing.T) {
 	r := &Request{
