@@ -51,10 +51,15 @@ type TokenStore struct {
 
 	sttMutex              sync.RWMutex
 	supportedTokenFormats []token.Format
+
+	// unspentTokensStmts caches prepared statements for UnspentTokensIteratorBy,
+	// keyed by argument shape (walletID present/absent, tokenType
+	// present/absent). See #1183.
+	unspentTokensStmts PreparedStmtHolder[string]
 }
 
 func newTokenStore(readDB, writeDB *sql.DB, tables tokenTables, ci common3.CondInterpreter, notifier driver.TokenNotifier, cleanupLeaderFactory func(context.Context, *sql.DB, int64) (driver.CleanupLeadership, bool, error)) *TokenStore {
-	return &TokenStore{
+	ts := &TokenStore{
 		readDB:               readDB,
 		writeDB:              writeDB,
 		table:                tables,
@@ -62,6 +67,9 @@ func newTokenStore(readDB, writeDB *sql.DB, tables tokenTables, ci common3.CondI
 		notifier:             notifier,
 		cleanupLeaderFactory: cleanupLeaderFactory,
 	}
+	ts.unspentTokensStmts = newPreparedStmtHolder[string]()
+
+	return ts
 }
 
 func NewTokenStoreWithNotifier(readDB, writeDB *sql.DB, tables TableNames, ci common3.CondInterpreter, notifier driver.TokenNotifier) (*TokenStore, error) {
@@ -268,11 +276,36 @@ func buildUnspentTokensIteratorByQuery(db *TokenStore, walletID string, tokenTyp
 	return sb.Build()
 }
 
-func (db *TokenStore) UnspentTokensIteratorBy(ctx context.Context, walletID string, tokenType token.Type) (tdriver.UnspentTokensIterator, error) {
-	query, args := buildUnspentTokensIteratorByQuery(db, walletID, tokenType)
+// unspentTokensStmtKey returns the cache key for the argument shape of an
+// UnspentTokensIteratorBy call. The generated SQL depends only on whether
+// walletID and tokenType are empty, not on their values, so calls of the
+// same shape can share one prepared statement.
+func unspentTokensStmtKey(walletID string, tokenType token.Type) string {
+	key := [2]byte{'0', '0'}
+	if len(walletID) > 0 {
+		key[0] = '1'
+	}
+	if len(tokenType) > 0 {
+		key[1] = '1'
+	}
 
-	logging.Debug(logger, query, args)
-	rows, err := db.readDB.QueryContext(ctx, query, args...)
+	return string(key[:])
+}
+
+// PreparedStmtCount returns the number of cached prepared statements for
+// UnspentTokensIteratorBy. Intended for tests verifying statement reuse
+// across argument shapes.
+func (db *TokenStore) PreparedStmtCount() int {
+	return db.unspentTokensStmts.Count()
+}
+
+func (db *TokenStore) UnspentTokensIteratorBy(ctx context.Context, walletID string, tokenType token.Type) (tdriver.UnspentTokensIterator, error) {
+	key := unspentTokensStmtKey(walletID, tokenType)
+	rows, err := db.unspentTokensStmts.Execute(ctx, db.readDB, key, func() (string, []any, error) {
+		query, args := buildUnspentTokensIteratorByQuery(db, walletID, tokenType)
+
+		return query, args, nil
+	})
 	if err != nil {
 		return nil, errors.Wrapf(err, "error querying unspent tokens for wallet [%s] type [%s]", walletID, tokenType)
 	}
@@ -1388,6 +1421,8 @@ func (db *TokenStore) GetSchema() string {
 }
 
 func (db *TokenStore) Close() error {
+	_ = db.unspentTokensStmts.Close()
+
 	return common2.Close(db.readDB, db.writeDB)
 }
 
