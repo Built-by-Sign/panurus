@@ -12,12 +12,14 @@ import (
 	"time"
 
 	math "github.com/IBM/mathlib"
+	"github.com/LFDT-Panurus/panurus/token/core/common"
 	"github.com/LFDT-Panurus/panurus/token/core/zkatdlog/nogh/v1/token"
 	"github.com/LFDT-Panurus/panurus/token/core/zkatdlog/nogh/v1/transfer"
 	"github.com/LFDT-Panurus/panurus/token/driver"
 	"github.com/LFDT-Panurus/panurus/token/services/identity"
 	htlc2 "github.com/LFDT-Panurus/panurus/token/services/identity/interop/htlc"
 	"github.com/LFDT-Panurus/panurus/token/services/interop/htlc"
+	"github.com/LFDT-Panurus/panurus/token/services/utils"
 	token2 "github.com/LFDT-Panurus/panurus/token/token"
 	"github.com/hyperledger-labs/fabric-smart-client/pkg/utils/errors"
 )
@@ -62,6 +64,9 @@ func TransferSignatureValidate(c context.Context, ctx *Context) error {
 		verifier, err := ctx.Deserializer.GetOwnerVerifier(c, tok.Owner)
 		if err != nil {
 			return errors.Wrapf(err, "failed deserializing owner [%d][%s]", i, uniqueID)
+		}
+		if utils.IsNil(ctx.SignatureProvider) {
+			return common.ErrNilSignatureProvider
 		}
 		ctx.Logger.Debugf("signature verification [%d][%s]", i, uniqueID)
 		sigma, err := ctx.SignatureProvider.HasBeenSignedBy(c, tok.Owner, verifier)

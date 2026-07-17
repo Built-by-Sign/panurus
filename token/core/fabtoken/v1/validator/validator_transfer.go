@@ -10,12 +10,14 @@ import (
 	"context"
 	"time"
 
+	"github.com/LFDT-Panurus/panurus/token/core/common"
 	"github.com/LFDT-Panurus/panurus/token/core/common/encoding/json"
 	"github.com/LFDT-Panurus/panurus/token/core/fabtoken/v1/actions"
 	"github.com/LFDT-Panurus/panurus/token/driver"
 	"github.com/LFDT-Panurus/panurus/token/services/identity"
 	htlc2 "github.com/LFDT-Panurus/panurus/token/services/identity/interop/htlc"
 	"github.com/LFDT-Panurus/panurus/token/services/interop/htlc"
+	"github.com/LFDT-Panurus/panurus/token/services/utils"
 	"github.com/LFDT-Panurus/panurus/token/token"
 	"github.com/hyperledger-labs/fabric-smart-client/pkg/utils/errors"
 )
@@ -48,6 +50,9 @@ func TransferSignatureValidate(c context.Context, ctx *Context) error {
 				return errors.Wrapf(err, "failed deserializing owner [%d][%v][%s]", i, in, driver.Identity(owner).UniqueID())
 			}
 			verifierCache[ownerKey] = verifier
+		}
+		if utils.IsNil(ctx.SignatureProvider) {
+			return common.ErrNilSignatureProvider
 		}
 		ctx.Logger.Debugf("signature verification [%v][%s]", tok, driver.Identity(owner).UniqueID())
 
