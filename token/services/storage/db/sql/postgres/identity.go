@@ -21,8 +21,9 @@ import (
 // IdentityStore wraps common.IdentityStore to add advisory lock to schema creation
 type IdentityStore struct {
 	*sqlcommon.IdentityStore
-	writeDB *sql.DB
-	lockID  int64
+	writeDB  *sql.DB
+	lockID   int64
+	notifier *IdentityNotifier
 }
 
 // GetSchema overrides the base GetSchema to prefix with advisory lock
@@ -62,6 +63,7 @@ func NewIdentityStore(dbs *scommon.RWDB, tableNames sqlcommon.TableNames, dataSo
 		IdentityStore: baseStore,
 		writeDB:       dbs.WriteDB,
 		lockID:        createTableLockID("identity"),
+		notifier:      notifier,
 	}, nil
 }
 

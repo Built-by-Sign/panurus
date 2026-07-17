@@ -9,12 +9,14 @@ package postgres
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
 
 	herrors "github.com/hyperledger-labs/fabric-smart-client/pkg/utils/errors"
 	"github.com/hyperledger-labs/fabric-smart-client/platform/view/services/storage/driver"
+	fscPostgres "github.com/hyperledger-labs/fabric-smart-client/platform/view/services/storage/driver/sql/postgres"
 	"github.com/jackc/pgxlisten"
 	"github.com/stretchr/testify/require"
 )
@@ -66,6 +68,257 @@ func TestNotifierSubscribeError(t *testing.T) {
 	err := db.Subscribe(func(operation driver.Operation, m map[driver.ColumnKey]string) {})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "listener failed to start")
+}
+
+// TestNotifierSubscribeInstallsSchemaOnce tests that the notification schema
+// (trigger) is installed lazily on the first subscription only.
+func TestNotifierSubscribeInstallsSchemaOnce(t *testing.T) {
+	var schemaCalls int
+	listenStarted := make(chan struct{}, 1)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	db := &Notifier{
+		table: "test_table",
+		listener: &mockListener{
+			ListenFN: func(ctx context.Context) error {
+				listenStarted <- struct{}{}
+				<-ctx.Done()
+
+				return ctx.Err()
+			},
+		},
+		listenerErr: make(chan error, 1),
+		ctx:         ctx,
+		cancel:      cancel,
+	}
+	db.ensureSchema = func() error {
+		require.Empty(t, listenStarted, "schema must be installed before the listener starts")
+		schemaCalls++
+
+		return nil
+	}
+
+	for range 3 {
+		require.NoError(t, db.Subscribe(func(driver.Operation, map[driver.ColumnKey]string) {}))
+	}
+	require.Equal(t, 1, schemaCalls, "schema must be installed exactly once, on first subscription")
+}
+
+// TestNotifierSubscribeSchemaError tests that Subscribe surfaces a schema
+// installation failure and does not start the listener.
+func TestNotifierSubscribeSchemaError(t *testing.T) {
+	var listenCalled bool
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	db := &Notifier{
+		table: "test_table",
+		listener: &mockListener{
+			ListenFN: func(ctx context.Context) error {
+				listenCalled = true
+
+				return nil
+			},
+		},
+		listenerErr: make(chan error, 1),
+		ctx:         ctx,
+		cancel:      cancel,
+	}
+	db.ensureSchema = func() error { return errors.New("no DDL permissions") }
+
+	err := db.Subscribe(func(driver.Operation, map[driver.ColumnKey]string) {})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "no DDL permissions")
+	require.False(t, listenCalled, "listener must not start when schema installation fails")
+}
+
+// TestNotifierSubscribeSchemaFailureIsFinal tests that a schema installation
+// failure is final: it is not retried and every Subscribe returns it.
+func TestNotifierSubscribeSchemaFailureIsFinal(t *testing.T) {
+	var schemaCalls int
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	db := &Notifier{
+		table:       "test_table",
+		listener:    &mockListener{},
+		listenerErr: make(chan error, 1),
+		ctx:         ctx,
+		cancel:      cancel,
+	}
+	db.ensureSchema = func() error {
+		schemaCalls++
+
+		return errors.New("no DDL permissions")
+	}
+
+	for range 3 {
+		err := db.Subscribe(func(driver.Operation, map[driver.ColumnKey]string) {})
+		require.ErrorContains(t, err, "no DDL permissions")
+	}
+	require.Equal(t, 1, schemaCalls, "a failed installation must not be retried")
+}
+
+// TestNotifierSubscribeSchemaErrorAllSubscribers tests that concurrent
+// subscribers all observe a schema installation failure.
+func TestNotifierSubscribeSchemaErrorAllSubscribers(t *testing.T) {
+	release := make(chan struct{})
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	db := &Notifier{
+		table:       "test_table",
+		listener:    &mockListener{},
+		listenerErr: make(chan error, 1),
+		ctx:         ctx,
+		cancel:      cancel,
+	}
+	db.ensureSchema = func() error {
+		<-release
+
+		return errors.New("no DDL permissions")
+	}
+
+	errs := make([]error, 8)
+	var wg sync.WaitGroup
+	for i := range errs {
+		wg.Go(func() {
+			errs[i] = db.Subscribe(func(driver.Operation, map[driver.ColumnKey]string) {})
+		})
+	}
+	close(release)
+	wg.Wait()
+	for _, err := range errs {
+		require.ErrorContains(t, err, "no DDL permissions")
+	}
+}
+
+// TestNotifierCloseDuringSchemaInstall tests that closing the notifier while
+// the schema is being installed neither panics nor starts the listener.
+func TestNotifierCloseDuringSchemaInstall(t *testing.T) {
+	installing := make(chan struct{})
+	release := make(chan struct{})
+	var listenCalled bool
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	db := &Notifier{
+		table: "test_table",
+		listener: &mockListener{
+			ListenFN: func(ctx context.Context) error {
+				listenCalled = true
+
+				return nil
+			},
+		},
+		listenerErr: make(chan error, 1),
+		ctx:         ctx,
+		cancel:      cancel,
+	}
+	db.ensureSchema = func() error {
+		close(installing)
+		<-release
+
+		return nil
+	}
+
+	subscribed := make(chan error, 1)
+	go func() {
+		subscribed <- db.Subscribe(func(driver.Operation, map[driver.ColumnKey]string) {})
+	}()
+	<-installing
+	require.NoError(t, db.Close())
+	close(release)
+
+	err := <-subscribed
+	require.Error(t, err, "subscribing to a notifier closed mid-install must fail")
+	require.False(t, listenCalled, "listener must not start after Close")
+}
+
+// TestNotifierSkipSchemaManagement tests that a notifier with schema
+// management disabled runs no DDL and still starts the listener.
+func TestNotifierSkipSchemaManagement(t *testing.T) {
+	listenStarted := make(chan struct{}, 1)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	db := &Notifier{
+		table: "test_table",
+		listener: &mockListener{
+			ListenFN: func(ctx context.Context) error {
+				listenStarted <- struct{}{}
+				<-ctx.Done()
+
+				return ctx.Err()
+			},
+		},
+		listenerErr: make(chan error, 1),
+		ctx:         ctx,
+		cancel:      cancel,
+	}
+	db.ensureSchema = func() error {
+		t.Error("no DDL must run when schema management is disabled")
+
+		return nil
+	}
+	db.skipSchemaManagement()
+
+	require.NoError(t, db.Subscribe(func(driver.Operation, map[driver.ColumnKey]string) {}))
+	select {
+	case <-listenStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("listener did not start")
+	}
+}
+
+// TestNotifierLazyTriggerInstall verifies against a real Postgres that no
+// trigger exists before the first subscription, that subscribing installs it,
+// and that notifications are delivered afterwards.
+func TestNotifierLazyTriggerInstall(t *testing.T) {
+	terminate, pgConnStr := startContainer(t)
+	defer terminate()
+
+	dbs, err := fscPostgres.NewDbProvider().Get(fscPostgres.Opts{
+		DataSource:   pgConnStr,
+		MaxOpenConns: 5,
+		MaxIdleConns: 2,
+		MaxIdleTime:  time.Minute,
+	})
+	require.NoError(t, err)
+
+	const table = "lazy_trigger_test"
+	_, err = dbs.WriteDB.Exec("CREATE TABLE " + table + " (id TEXT PRIMARY KEY)")
+	require.NoError(t, err)
+
+	n := NewNotifier(dbs.WriteDB, table, pgConnStr, AllOperations, *NewSimplePrimaryKey("id"))
+	defer func() { require.NoError(t, n.Close()) }()
+
+	triggerCount := func() int {
+		var count int
+		require.NoError(t, dbs.WriteDB.QueryRow(
+			`SELECT count(*) FROM pg_trigger WHERE tgname = $1`, "trigger_"+table).Scan(&count))
+
+		return count
+	}
+	require.Zero(t, triggerCount(), "no trigger must exist before the first subscription")
+
+	notified := make(chan struct{}, 1)
+	require.NoError(t, n.Subscribe(func(driver.Operation, map[driver.ColumnKey]string) {
+		select {
+		case notified <- struct{}{}:
+		default:
+		}
+	}))
+	require.Equal(t, 1, triggerCount(), "the first subscription must install the trigger")
+
+	// LISTEN starts asynchronously: keep inserting until a notification lands
+	i := 0
+	require.Eventually(t, func() bool {
+		i++
+		_, err := dbs.WriteDB.Exec("INSERT INTO "+table+" (id) VALUES ($1)", fmt.Sprintf("id%d", i))
+		require.NoError(t, err)
+		select {
+		case <-notified:
+			return true
+		default:
+			return false
+		}
+	}, 15*time.Second, 200*time.Millisecond, "no notification received after installing the trigger")
 }
 
 // TestNotifierSubscribeClosed tests that Subscribe returns an error when notifier is closed
