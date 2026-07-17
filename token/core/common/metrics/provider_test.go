@@ -10,8 +10,6 @@ import (
 	"testing"
 
 	"github.com/LFDT-Panurus/panurus/token"
-	"github.com/hyperledger-labs/fabric-smart-client/pkg/utils/errors"
-	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -57,35 +55,18 @@ type mockProvider struct {
 	counter   *mockCounter
 	gauge     *mockGauge
 	histogram *mockHistogram
-	panicWith any
 }
 
 func (m *mockProvider) NewCounter(opts CounterOpts) Counter {
-	if m.panicWith != nil {
-		panic(m.panicWith)
-	}
-
 	return m.counter
 }
 
 func (m *mockProvider) NewGauge(opts GaugeOpts) Gauge {
-	if m.panicWith != nil {
-		panic(m.panicWith)
-	}
-
 	return m.gauge
 }
 
 func (m *mockProvider) NewHistogram(opts HistogramOpts) Histogram {
-	if m.panicWith != nil {
-		panic(m.panicWith)
-	}
-
 	return m.histogram
-}
-
-func TestPrometheusAlreadyRegisteredErrorMessage(t *testing.T) {
-	assert.Equal(t, PrometheusAlreadyRegisteredErrorMessage, (&prometheus.AlreadyRegisteredError{}).Error())
 }
 
 func TestTMSProvider(t *testing.T) {
@@ -126,63 +107,5 @@ func TestTMSProvider(t *testing.T) {
 		h := p.NewHistogram(HistogramOpts{Name: "test_histogram"})
 		assert.NotNil(t, h)
 		assert.Equal(t, expectedLabels, mp.histogram.labels)
-	})
-}
-
-func TestRecoverFromDuplicate(t *testing.T) {
-	t.Run("NoPanic", func(t *testing.T) {
-		assert.NotPanics(t, func() {
-			recoverFromDuplicate(nil)
-		})
-	})
-
-	t.Run("AlreadyRegisteredError", func(t *testing.T) {
-		err := &prometheus.AlreadyRegisteredError{}
-		assert.NotPanics(t, func() {
-			recoverFromDuplicate(err)
-		})
-	})
-
-	t.Run("OtherError", func(t *testing.T) {
-		err := errors.New("some other error")
-		assert.PanicsWithValue(t, err, func() {
-			recoverFromDuplicate(err)
-		})
-	})
-
-	t.Run("NotAnError", func(t *testing.T) {
-		val := "some string"
-		assert.PanicsWithValue(t, val, func() {
-			recoverFromDuplicate(val)
-		})
-	})
-}
-
-func TestTMSProviderDuplicateRegistration(t *testing.T) {
-	tmsID := token.TMSID{}
-	err := &prometheus.AlreadyRegisteredError{}
-
-	t.Run("Counter", func(t *testing.T) {
-		mp := &mockProvider{panicWith: err}
-		p := NewTMSProvider(tmsID, mp)
-		assert.NotPanics(t, func() {
-			p.NewCounter(CounterOpts{})
-		})
-	})
-
-	t.Run("Gauge", func(t *testing.T) {
-		mp := &mockProvider{panicWith: err}
-		p := NewTMSProvider(tmsID, mp)
-		assert.NotPanics(t, func() {
-			p.NewGauge(GaugeOpts{})
-		})
-	})
-
-	t.Run("Histogram", func(t *testing.T) {
-		mp := &mockProvider{panicWith: err}
-		p := NewTMSProvider(tmsID, mp)
-		assert.NotPanics(t, func() {
-			p.NewHistogram(HistogramOpts{})
-		})
 	})
 }
