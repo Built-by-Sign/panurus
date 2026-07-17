@@ -106,6 +106,9 @@ func newTokenStoreProvider(dbProvider fscPostgres.DbProvider, tableNamesConfig c
 		if err != nil {
 			return nil, err
 		}
+		if o.SkipCreateTable {
+			notifier.skipSchemaManagement()
+		}
 
 		// db
 		p, err := NewTokenStoreWithNotifier(dbs, tableNames, notifier)
@@ -114,9 +117,6 @@ func newTokenStoreProvider(dbProvider fscPostgres.DbProvider, tableNamesConfig c
 		}
 		if !o.SkipCreateTable {
 			if err := p.CreateSchema(); err != nil {
-				return nil, err
-			}
-			if err := notifier.CreateSchema(); err != nil {
 				return nil, err
 			}
 		}
@@ -151,18 +151,12 @@ func newIdentityStoreProvider(dbProvider fscPostgres.DbProvider, tableNamesConfi
 		if err != nil {
 			return nil, err
 		}
-
-		// Get notifier for schema creation
-		notifier, err := NewIdentityNotifier(dbs, tableNames, o.DataSource)
-		if err != nil {
-			return nil, err
+		if o.SkipCreateTable {
+			p.notifier.skipSchemaManagement()
 		}
 
 		if !o.SkipCreateTable {
 			if err := p.CreateSchema(); err != nil {
-				return nil, err
-			}
-			if err := notifier.CreateSchema(); err != nil {
 				return nil, err
 			}
 		}
@@ -197,6 +191,9 @@ func newTransactionStoreProvider(dbProvider fscPostgres.DbProvider, tableNamesCo
 		if err != nil {
 			return nil, err
 		}
+		if o.SkipCreateTable {
+			notifier.skipSchemaManagement()
+		}
 
 		// db
 		p, err := NewTransactionStoreWithNotifier(dbs, tableNames, notifier)
@@ -205,9 +202,6 @@ func newTransactionStoreProvider(dbProvider fscPostgres.DbProvider, tableNamesCo
 		}
 		if !o.SkipCreateTable {
 			if err := p.CreateSchema(); err != nil {
-				return nil, err
-			}
-			if err := notifier.CreateSchema(); err != nil {
 				return nil, err
 			}
 		}
