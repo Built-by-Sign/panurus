@@ -141,6 +141,27 @@ func (d *Base) NewWalletService(...) (*wallet.Service, error) {
 }
 ```
 
+### SignerRouter (conf_id-pinned fast path)
+
+`GetSigner`'s default resolution path is a **fallback deserializer**: a linear scan across every `KeyManager` registered under the identity's type, each probed with a cryptographic sign+verify to find the one that actually matches. `SignerRouter` (`token/services/identity/signer_router.go`) is an optional fast path that skips this scan-and-probe entirely: it resolves the `conf_id` an identity was bound under (via a `ConfIDResolver`) and dispatches straight to the single `KeyManager` registered for that `conf_id`.
+
+*   **Wiring**: a driver builds a `SignerRouter` with `identity.NewSignerRouter(m *Metrics)`, registers `KeyManager`s against their `conf_id` with `Register`, sets a `ConfIDResolver` with `SetConfIDResolver`, and attaches it to the `Provider` with `Provider.SetSignerRouter`. See `token/core/fabtoken/v1/driver/ws.go` and the zkatdlog equivalent.
+*   **Fallback semantics**: `Resolve` returns `ok=false` (never an error) whenever routing cannot be attempted (no resolver set, no `conf_id` mapping, no `KeyManager` registered for it) or the routed `KeyManager` itself fails — callers always fall back to the probing deserializer in that case, never treating it as a hard failure.
+*   **Probe-free deserialization**: when the registered `KeyManager` also implements `idriver.ProbeFreeSignerDeserializer`, `Resolve` calls `DeserializeSignerNoProbe` directly, skipping the cryptographic probe that the fallback path relies on to catch a mismatched `KeyManager`. This is only safe because the `conf_id` already pins the identity to exactly one `KeyManager`.
+
+#### Metrics
+
+`identity.Metrics` (`token/services/identity/metrics.go`) instruments both `Provider.GetSigner` and `SignerRouter`, sharing one `Metrics` instance built with `identity.NewMetrics(provider)` (a `nil` provider yields a `disabled.Provider`-backed noop):
+
+| Metric | Type | Labels | Purpose |
+|:-------|:-----|:-------|:--------|
+| `identity_signer_resolutions_total` | Counter | `network`, `channel`, `namespace`, `outcome` = `cache` \| `routed` \| `fallback` | How each `GetSigner` call was ultimately resolved. |
+| `identity_get_signer_duration_seconds` | Histogram | `network`, `channel`, `namespace`, `path` = `cache` \| `routed` \| `fallback` | `GetSigner` wall-clock time by resolution path; compares the latency saved by skipping the probe. |
+| `identity_signer_router_registrations_total` | Counter | `network`, `channel`, `namespace` | `conf_id`→`KeyManager` bindings registered with the `SignerRouter`. A near-zero count in production means routing is never populated and every call falls back. |
+| `identity_signer_router_no_probe_errors_total` | Counter | `network`, `channel`, `namespace` | Failures of the probe-free deserialization path — since that path skips the cryptographic check, a non-zero count is worth investigating as a `conf_id` routing bug. |
+
+> **Note:** `provider` here is a `NewTMSProvider`-wrapped `Provider` (see [Driver Metrics](../drivers/metrics.md#pitfall-labelnames-must-include-network-channel-namespace)), which binds `network`/`channel`/`namespace` on every metric via `.With(...)` before returning it. Every `CounterOpts`/`HistogramOpts` above must therefore declare those three as `LabelNames` in addition to its own label(s), or the metric panics with "inconsistent label cardinality" on first use. This is exactly the bug that crashed the DVP/DLog integration suite in `SignerRouter.Register` before it was fixed.
+
 ## Identity Types
 
 The Identity Service leverages a wrapper called **TypedIdentity** to support various identity schemes uniformly. 

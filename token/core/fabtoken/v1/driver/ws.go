@@ -8,6 +8,7 @@ package driver
 
 import (
 	"github.com/LFDT-Panurus/panurus/token/core"
+	"github.com/LFDT-Panurus/panurus/token/core/common/metrics"
 	v2 "github.com/LFDT-Panurus/panurus/token/core/fabtoken/v1/setup"
 	"github.com/LFDT-Panurus/panurus/token/driver"
 	"github.com/LFDT-Panurus/panurus/token/services/identity"
@@ -38,6 +39,7 @@ func (d BaseWalletServiceFactory) newWalletService(
 	networkDefaultIdentity driver.Identity,
 	pp driver.PublicParameters,
 	ignoreRemote bool,
+	metricsProvider metrics.Provider,
 ) (*wallet.Service, error) {
 	tmsID := tmsConfig.ID()
 
@@ -50,7 +52,10 @@ func (d BaseWalletServiceFactory) newWalletService(
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to open keystore for tms [%s]", tmsID)
 	}
-	identityProvider := identity.NewProvider(logger.Named("identity"), identityDB, deserializerManager, binder, NewEIDRHDeserializer())
+	identityMetrics := identity.NewMetrics(metricsProvider)
+	signerRouter := identity.NewSignerRouter(identityMetrics)
+	identityProvider := identity.NewProvider(logger.Named("identity"), identityDB, deserializerManager, binder, NewEIDRHDeserializer(), identityMetrics)
+	identityProvider.SetSignerRouter(signerRouter)
 	identityConfig, err := config.NewIdentityConfig(tmsConfig)
 	if err != nil {
 		return nil, errors.WithMessagef(err, "failed to create identity config")
@@ -68,6 +73,7 @@ func (d BaseWalletServiceFactory) newWalletService(
 		storageProvider,
 		deserializerManager,
 	)
+	roleFactory.SetSignerRouter(signerRouter)
 	newRole, err := roleFactory.NewRole(identity.OwnerRole, false, nil, x509.NewKeyManagerProvider(identityConfig, keyStore, ignoreRemote))
 	if err != nil {
 		return nil, errors.WithMessagef(err, "failed to create owner role")
@@ -95,12 +101,13 @@ func (d BaseWalletServiceFactory) newWalletService(
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to get identity storage provider")
 	}
+	signerRouter.SetConfIDResolver(walletDB)
 	deserializer := NewDeserializer()
 	ws := wallet.NewService(
 		logger,
 		identityProvider,
 		deserializer,
-		wallet.Convert(roles.Registries(logger, walletDB, role.NewDefaultFactory(logger, identityProvider, qe, identityConfig, deserializer, &disabled.Provider{}))),
+		wallet.Convert(roles.Registries(logger, walletDB, role.NewDefaultFactory(logger, identityProvider, qe, identityConfig, deserializer, metricsProvider))),
 	)
 
 	return ws, nil
@@ -136,5 +143,6 @@ func (d *WalletServiceFactory) NewWalletService(tmsConfig driver.Configuration, 
 		nil,
 		params,
 		true,
+		&disabled.Provider{},
 	)
 }
