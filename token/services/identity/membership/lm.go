@@ -10,6 +10,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"sync"
 	"unicode/utf8"
@@ -25,6 +26,7 @@ import (
 	"github.com/hyperledger-labs/fabric-smart-client/platform/common/utils/collections"
 	"github.com/hyperledger-labs/fabric-smart-client/platform/view/view"
 	"go.yaml.in/yaml/v3"
+	"golang.org/x/sync/errgroup"
 )
 
 const (
@@ -105,6 +107,10 @@ type IdentityProvider interface {
 // KeyManagerProvider is responsible for producing a KeyManager for a given
 // IdentityConfiguration. Multiple providers can be registered; the first one
 // that succeeds is used for that identity.
+// Get may be called concurrently for distinct configurations: Load resolves
+// stored identity configurations in parallel. Each successfully returned
+// KeyManager must either be independently owned by the caller or safe for
+// concurrent EnrollmentID calls.
 //
 //go:generate counterfeiter -o mock/kmp.go -fake-name KeyManagerProvider . KeyManagerProvider
 type KeyManagerProvider interface {
@@ -372,21 +378,69 @@ func (l *LocalMembership) Load(ctx context.Context, identities []idriver.Configu
 			if !found {
 				// keep this
 				filtered = append(filtered, stored)
-				defaults = append(defaults, false)
 			}
 		}
 	}
 
-	ics := append(identityConfigurations, filtered...)
-
-	// load identities from configuration
-	for i, identityConfiguration := range ics {
+	// load identities from configuration.
+	// Configured identities (few, may carry the default flag) are registered
+	// sequentially to preserve default-identity semantics.
+	for i, identityConfiguration := range identityConfigurations {
 		l.logger.Debugf("load identity configuration [%+v]", identityConfiguration)
 		if err := l.registerIdentityConfiguration(ctx, &identityConfiguration, defaults[i]); err != nil {
 			// we log the error so the user can fix it but it shouldn't stop the loading of the service.
 			l.logger.Errorf("failed loading identity with err [%s]", err)
 		} else {
 			l.logger.Debugf("load wallet for identity [%+v] done.", identityConfiguration)
+		}
+	}
+
+	// Stored identity configurations (potentially hundreds of thousands, all
+	// non-default) are prepared in parallel: the expensive KeyManager
+	// construction runs concurrently, then the results are committed to the
+	// shared indices sequentially in the original iterator order, so identity
+	// ordering (fallback default selection, same-name tie-breaks) matches the
+	// sequential behaviour. Errors are logged and skipped, as above.
+	if len(filtered) > 0 {
+		l.logger.Infof("loading [%d] stored identity configurations with up to [%d] workers", len(filtered), runtime.NumCPU())
+		// translate paths serially: Config does not promise concurrency safety
+		for i := range filtered {
+			filtered[i].URL = l.config.TranslatePath(filtered[i].URL)
+		}
+		type prepared struct {
+			keyManager KeyManager
+			priority   int
+			err        error
+		}
+		results := make([]prepared, len(filtered))
+		var g errgroup.Group
+		g.SetLimit(runtime.NumCPU())
+		for i := range filtered {
+			g.Go(func() error {
+				identityConfiguration := &filtered[i]
+				l.logger.Debugf("load identity configuration [%+v]", identityConfiguration)
+				keyManager, priority, err := l.resolveKeyManager(ctx, identityConfiguration)
+				results[i] = prepared{keyManager: keyManager, priority: priority, err: err}
+
+				return nil
+			})
+		}
+		_ = g.Wait() // workers never return errors; Wait only synchronises completion
+
+		for i := range filtered {
+			identityConfiguration := &filtered[i]
+			err1 := results[i].err
+			if err1 == nil {
+				err1 = l.commitLocalIdentity(ctx, identityConfiguration, results[i].keyManager, results[i].priority, false)
+				if err1 == nil {
+					continue
+				}
+			}
+			// second chance, load the path as folder (mirrors registerIdentityConfiguration)
+			l.logger.Warnf("failed to load local identity at [%s]:[%s]", identityConfiguration.URL, err1)
+			if err2 := l.registerLocalIdentities(ctx, identityConfiguration); err2 != nil {
+				l.logger.Errorf("failed loading identity with err [%s]", errors.Wrapf(errors.Join(err1, err2), "failed to register local identity"))
+			}
 		}
 	}
 
@@ -528,6 +582,19 @@ func (l *LocalMembership) toIdentityConfiguration(identities []idriver.Configure
 }
 
 func (l *LocalMembership) registerLocalIdentity(ctx context.Context, identityConfig *IdentityConfiguration, defaultIdentity bool) error {
+	keyManager, priority, err := l.resolveKeyManager(ctx, identityConfig)
+	if err != nil {
+		return err
+	}
+
+	return l.commitLocalIdentity(ctx, identityConfig, keyManager, priority, defaultIdentity)
+}
+
+// resolveKeyManager constructs a KeyManager for the given configuration by
+// probing the registered providers in order. It does not mutate the
+// LocalMembership identity indices; concurrent use relies on the
+// KeyManagerProvider contract.
+func (l *LocalMembership) resolveKeyManager(ctx context.Context, identityConfig *IdentityConfiguration) (KeyManager, int, error) {
 	var errs []error
 	var keyManager KeyManager
 	var priority int
@@ -558,20 +625,28 @@ func (l *LocalMembership) registerLocalIdentity(ctx context.Context, identityCon
 		logger.Errorf("no key manager found for identity [%s], err [%+v]", identityConfig.ID, errs)
 		err := errors.Join(errs...)
 		if err != nil {
-			return errors.Wrapf(err,
+			return nil, 0, errors.Wrapf(err,
 				"failed to get a key manager for the passed identity config for [%s:%s]",
 				identityConfig.ID,
 				identityConfig.URL,
 			)
 		}
 
-		return errors.Errorf(
+		return nil, 0, errors.Errorf(
 			"no key manager found for [%s:%s]",
 			identityConfig.ID,
 			identityConfig.URL,
 		)
 	}
 
+	return keyManager, priority, nil
+}
+
+// commitLocalIdentity registers a resolved KeyManager with the in-memory
+// indices and persists the configuration if not stored yet. Must run on a
+// single goroutine at a time (Load and the runtime registration paths hold
+// localIdentitiesMutex).
+func (l *LocalMembership) commitLocalIdentity(ctx context.Context, identityConfig *IdentityConfiguration, keyManager KeyManager, priority int, defaultIdentity bool) error {
 	l.logger.DebugfContext(ctx, "append local identity for [%s]", identityConfig.ID)
 	if err := l.addLocalIdentity(ctx, identityConfig, keyManager, defaultIdentity, priority); err != nil {
 		return errors.Wrapf(err, "failed to add local identity for [%s]", identityConfig.ID)

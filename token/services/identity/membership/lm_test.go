@@ -9,10 +9,15 @@ package membership_test
 import (
 	"context"
 	stdErrors "errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/LFDT-Panurus/panurus/token"
 	mock2 "github.com/LFDT-Panurus/panurus/token/driver/mock"
@@ -931,4 +936,171 @@ func TestRefreshAndGet_NonUTF8LabelSkipsStore(t *testing.T) {
 
 	assert.Equal(t, 0, iss.ConfigurationsByIDCallCount())
 	assert.Equal(t, 0, iss.IteratorConfigurationsCallCount())
+}
+
+// newStoredOnlyMembership builds a LocalMembership whose identity store
+// serves the given stored configurations and whose KeyManagerProvider is the
+// passed mock. No configured identities are loaded.
+func newStoredOnlyMembership(configs []idriver.IdentityConfiguration, kmp *mock.KeyManagerProvider) (*membership.LocalMembership, *mock.SignerDeserializerManager) {
+	ip := &mock.IdentityProvider{}
+	ip.BindReturns(nil)
+	des := &mock.SignerDeserializerManager{}
+
+	cfg := &mock.Config{}
+	cfg.TranslatePathCalls(func(p string) string { return p })
+
+	iss := &mock.IdentityStoreService{}
+	iss.ConfigurationExistsReturns(true, nil) // stored configs are already persisted
+	iss.NotifierReturns(nil, storage.ErrNotSupported)
+	it := &mock.IdentityConfigurationIterator{}
+	var iterMu sync.Mutex
+	served := 0
+	it.NextCalls(func() (*idriver.IdentityConfiguration, error) {
+		iterMu.Lock()
+		defer iterMu.Unlock()
+		if served >= len(configs) {
+			return nil, nil
+		}
+		served++
+
+		return &configs[served-1], nil
+	})
+	iss.IteratorConfigurationsReturns(it, nil)
+
+	lm := membership.NewLocalMembership(
+		logging.MustGetLogger("test"),
+		cfg,
+		[]byte("netid"),
+		des,
+		iss,
+		"testType",
+		false,
+		ip,
+		kmp,
+	)
+
+	return lm, des
+}
+
+func newTestKeyManager(enrollmentID string, id []byte) *mock.KeyManager {
+	km := &mock.KeyManager{}
+	km.EnrollmentIDReturns(enrollmentID)
+	km.AnonymousReturns(false)
+	km.IsRemoteReturns(false)
+	km.IdentityReturns(&idriver.IdentityDescriptor{Identity: id, AuditInfo: []byte("ai")}, nil)
+	km.IdentityTypeReturns(identity.Type(99))
+
+	return km
+}
+
+// TestLoad_ParallelStoredConfigurations exercises the parallel resolution
+// path for stored identity configurations (the 100k+ user-wallet scenario):
+// all identities must be registered and KeyManager construction must actually
+// overlap. Run with -race to validate the prepare/commit split.
+func TestLoad_ParallelStoredConfigurations(t *testing.T) {
+	ctx := t.Context()
+
+	const n = 500
+
+	configs := make([]idriver.IdentityConfiguration, n)
+	for i := range configs {
+		configs[i] = idriver.IdentityConfiguration{
+			ID:   fmt.Sprintf("wallet-%d", i+1),
+			Type: "testType",
+			URL:  fmt.Sprintf("/tmp/wallet-%d", i+1),
+		}
+	}
+
+	// a single shared KeyManager exercises the "shared and safe for
+	// concurrent EnrollmentID calls" flavour of the provider contract; the
+	// determinism tests below return independently owned instances.
+	km := newTestKeyManager("e1", []byte("id1"))
+	kmp := &mock.KeyManagerProvider{}
+	var inFlight, maxInFlight atomic.Int64
+	kmp.GetCalls(func(context.Context, *membership.IdentityConfiguration) (membership.KeyManager, error) {
+		cur := inFlight.Add(1)
+		defer inFlight.Add(-1)
+		for {
+			seen := maxInFlight.Load()
+			if cur <= seen || maxInFlight.CompareAndSwap(seen, cur) {
+				break
+			}
+		}
+		time.Sleep(time.Millisecond)
+
+		return km, nil
+	})
+
+	lm, des := newStoredOnlyMembership(configs, kmp)
+	require.NoError(t, lm.Load(ctx, nil, nil))
+
+	ids, err := lm.IDs()
+	require.NoError(t, err)
+	assert.Len(t, ids, n)
+	assert.Equal(t, n, des.AddTypedSignerDeserializerCallCount())
+	if runtime.NumCPU() > 1 {
+		assert.Greater(t, maxInFlight.Load(), int64(1), "KeyManager construction must overlap")
+	}
+}
+
+// TestLoad_FallbackDefaultKeepsIteratorOrder verifies that when no identity
+// carries the default flag, the fallback default is the first stored
+// configuration in iterator order, not the first whose KeyManager happens to
+// finish construction.
+func TestLoad_FallbackDefaultKeepsIteratorOrder(t *testing.T) {
+	ctx := t.Context()
+
+	configs := []idriver.IdentityConfiguration{
+		{ID: "wallet-1", Type: "testType", URL: "/tmp/wallet-1"},
+		{ID: "wallet-2", Type: "testType", URL: "/tmp/wallet-2"},
+		{ID: "wallet-3", Type: "testType", URL: "/tmp/wallet-3"},
+	}
+
+	kmp := &mock.KeyManagerProvider{}
+	kmp.GetCalls(func(_ context.Context, cfg *membership.IdentityConfiguration) (membership.KeyManager, error) {
+		// the first configuration finishes last
+		if cfg.ID == "wallet-1" {
+			time.Sleep(50 * time.Millisecond)
+		}
+
+		return newTestKeyManager("e-"+cfg.ID, []byte("id-"+cfg.ID)), nil
+	})
+
+	lm, _ := newStoredOnlyMembership(configs, kmp)
+	require.NoError(t, lm.Load(ctx, nil, nil))
+
+	assert.Equal(t, "wallet-1", lm.GetDefaultIdentifier(),
+		"fallback default must follow iterator order, not completion order")
+}
+
+// TestLoad_SameNameSamePriorityKeepsIteratorOrder verifies that two stored
+// configurations sharing name and priority resolve lookups to the first one
+// in iterator order even when the second finishes construction first.
+func TestLoad_SameNameSamePriorityKeepsIteratorOrder(t *testing.T) {
+	ctx := t.Context()
+
+	configs := []idriver.IdentityConfiguration{
+		{ID: "shared", Type: "testType", URL: "/tmp/shared-first"},
+		{ID: "shared", Type: "testType", URL: "/tmp/shared-second"},
+	}
+
+	kmp := &mock.KeyManagerProvider{}
+	kmp.GetCalls(func(_ context.Context, cfg *membership.IdentityConfiguration) (membership.KeyManager, error) {
+		if cfg.URL == "/tmp/shared-first" {
+			// the first configuration finishes last
+			time.Sleep(50 * time.Millisecond)
+
+			return newTestKeyManager("e-first", []byte("id-first")), nil
+		}
+
+		return newTestKeyManager("e-second", []byte("id-second")), nil
+	})
+
+	lm, _ := newStoredOnlyMembership(configs, kmp)
+	require.NoError(t, lm.Load(ctx, nil, nil))
+
+	info, err := lm.GetIdentityInfo(ctx, "shared", nil)
+	require.NoError(t, err)
+	assert.Equal(t, "e-first", info.EnrollmentID(),
+		"same-name same-priority lookup must follow iterator order, not completion order")
 }

@@ -93,6 +93,11 @@ The `LocalMembership` component (`token/services/identity/membership`) plays a p
     This ensures that the generated identity carries the correct type information required by the system (as defined in `token/services/identity/typed.go`).
 *   **Role Implementation**: `LocalMembership` serves as the foundational implementation for `role.Role`. 
     When you interact with a Role to resolve an identity or sign a transaction, you are effectively delegating to the underlying `LocalMembership`.
+*   **Loading**: `Load` first registers the identities coming from the configuration, then the configurations persisted in the identity store.
+    Stored configurations are resolved concurrently — `KeyManagerProvider.Get` must support concurrent calls for distinct configurations, and
+    each returned `KeyManager` must either be independently owned by the caller or safe for concurrent `EnrollmentID` calls — and the results
+    are committed to the in-memory indices sequentially in the original store order, so identity ordering (e.g. fallback default selection,
+    same-name tie-breaks) is deterministic.
 
 ### Example: Wiring Services
 
