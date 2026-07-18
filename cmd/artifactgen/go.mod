@@ -10,8 +10,8 @@ replace (
 require (
 	github.com/LFDT-Panurus/panurus v0.10.1
 	github.com/LFDT-Panurus/panurus/integration v0.0.0
-	github.com/hyperledger-labs/fabric-smart-client v0.14.3-0.20260716084917-c10decb043ec
-	github.com/hyperledger-labs/fabric-smart-client/integration v0.14.2
+	github.com/hyperledger-labs/fabric-smart-client v0.14.3-0.20260716152906-60a85d843ab6
+	github.com/hyperledger-labs/fabric-smart-client/integration v0.14.3-0.20260716152906-60a85d843ab6
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/viper v1.21.0
 	github.com/stretchr/testify v1.11.1
@@ -32,6 +32,7 @@ require (
 	github.com/benbjohnson/clock v1.3.5 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/bits-and-blooms/bitset v1.24.4 // indirect
+	github.com/bytedance/gopkg v0.1.3 // indirect
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/cockroachdb/errors v1.14.0 // indirect
@@ -78,7 +79,6 @@ require (
 	github.com/hyperledger/fabric-chaincode-go/v2 v2.3.1-0.20260319210430-56968fdc7833 // indirect
 	github.com/hyperledger/fabric-lib-go v1.1.5-0.20260708100132-163bcc919208 // indirect
 	github.com/hyperledger/fabric-protos-go-apiv2 v0.3.7 // indirect
-	github.com/hyperledger/fabric-x-common v0.2.8 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/ipfs/boxo v0.37.0 // indirect
 	github.com/ipfs/go-cid v0.6.1 // indirect

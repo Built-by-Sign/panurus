@@ -8,9 +8,10 @@ require (
 	github.com/IBM/idemix v0.2.0
 	github.com/IBM/mathlib v0.3.0
 	github.com/LFDT-Panurus/panurus v0.0.0
+	github.com/bytedance/gopkg v0.1.3
 	github.com/gin-gonic/gin v1.12.0
-	github.com/hyperledger-labs/fabric-smart-client v0.14.3-0.20260716084917-c10decb043ec
-	github.com/hyperledger-labs/fabric-smart-client/integration v0.14.2
+	github.com/hyperledger-labs/fabric-smart-client v0.14.3-0.20260716152906-60a85d843ab6
+	github.com/hyperledger-labs/fabric-smart-client/integration v0.14.3-0.20260716152906-60a85d843ab6
 	github.com/hyperledger/fabric-lib-go v1.1.5-0.20260708100132-163bcc919208
 	github.com/onsi/ginkgo/v2 v2.32.0
 	github.com/onsi/gomega v1.42.1
@@ -36,7 +37,6 @@ require (
 	github.com/benbjohnson/clock v1.3.5 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/bits-and-blooms/bitset v1.24.4 // indirect
-	github.com/bytedance/gopkg v0.1.3 // indirect
 	github.com/bytedance/sonic v1.15.0 // indirect
 	github.com/bytedance/sonic/loader v0.5.0 // indirect
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
