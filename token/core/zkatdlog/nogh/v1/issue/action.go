@@ -68,6 +68,22 @@ type Action struct {
 	Proof []byte
 	// Metadata of the issue action.
 	Metadata map[string][]byte
+
+	limits *driver.ResourceLimits
+}
+
+// SetLimits configures the resource limits enforced by Validate and Deserialize.
+func (i *Action) SetLimits(limits driver.ResourceLimits) {
+	i.limits = &limits
+}
+
+// effectiveLimits returns the configured limits, or the defaults if none were set.
+func (i *Action) effectiveLimits() driver.ResourceLimits {
+	if i.limits == nil {
+		return driver.DefaultResourceLimits()
+	}
+
+	return *i.limits
 }
 
 // NewAction instantiates an Action given the issuer's identity, token commitments, owners, and a proof.
@@ -214,6 +230,19 @@ func (i *Action) Validate() error {
 	if len(i.Proof) == 0 {
 		return ErrEmptyProof
 	}
+	limits := i.effectiveLimits()
+	if len(i.Proof) > limits.MaxProofBytes {
+		return errors.Wrapf(ErrProofTooLarge, "limit [%d] bytes", limits.MaxProofBytes)
+	}
+	if len(i.Inputs) > limits.MaxInputs {
+		return errors.Wrapf(ErrTooManyInputs, "limit [%d]", limits.MaxInputs)
+	}
+	if len(i.Outputs) > limits.MaxOutputs {
+		return errors.Wrapf(ErrTooManyOutputs, "limit [%d]", limits.MaxOutputs)
+	}
+	if err := checkMetadataLimits(i.Metadata, limits.MaxMetadataEntries, limits.MaxMetadataKeyBytes, limits.MaxMetadataValueBytes); err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -292,6 +321,23 @@ func (i *Action) Deserialize(raw []byte) error {
 	// assert version
 	if issueAction.Version != ProtocolV1 {
 		return errors.Join(ErrInvalidProtocolVersion, errors.Errorf("expected [%d], got [%d]", ProtocolV1, issueAction.Version))
+	}
+
+	// enforce resource limits before any allocation proportional to attacker-controlled counts
+	limits := i.effectiveLimits()
+	if len(issueAction.Inputs) > limits.MaxInputs {
+		return errors.Wrapf(ErrTooManyInputs, "limit [%d]", limits.MaxInputs)
+	}
+	if len(issueAction.Outputs) > limits.MaxOutputs {
+		return errors.Wrapf(ErrTooManyOutputs, "limit [%d]", limits.MaxOutputs)
+	}
+	if err := checkMetadataLimits(issueAction.Metadata, limits.MaxMetadataEntries, limits.MaxMetadataKeyBytes, limits.MaxMetadataValueBytes); err != nil {
+		return err
+	}
+	if proof := issueAction.GetProof(); proof != nil {
+		if len(proof.GetProof()) > limits.MaxProofBytes || len(proof.GetCspBasedProof()) > limits.MaxProofBytes {
+			return errors.Wrapf(ErrProofTooLarge, "limit [%d] bytes", limits.MaxProofBytes)
+		}
 	}
 
 	// inputs

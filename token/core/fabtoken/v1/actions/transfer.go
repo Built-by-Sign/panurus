@@ -76,6 +76,22 @@ type TransferAction struct {
 	Metadata map[string][]byte
 	// Issuer contains the identity of the issuer to sign the transfer action
 	Issuer driver.Identity
+
+	limits *driver.ResourceLimits
+}
+
+// SetLimits configures the resource limits enforced by Validate and Deserialize.
+func (t *TransferAction) SetLimits(limits driver.ResourceLimits) {
+	t.limits = &limits
+}
+
+// effectiveLimits returns the configured limits, or the defaults if none were set.
+func (t *TransferAction) effectiveLimits() driver.ResourceLimits {
+	if t.limits == nil {
+		return driver.DefaultResourceLimits()
+	}
+
+	return *t.limits
 }
 
 func (t *TransferAction) NumInputs() int {
@@ -194,6 +210,10 @@ func (t *TransferAction) Validate() error {
 	if len(t.Inputs) == 0 {
 		return errors.Errorf("invalid number of token inputs, expected at least 1")
 	}
+	limits := t.effectiveLimits()
+	if len(t.Inputs) > limits.MaxInputs {
+		return errors.Wrapf(ErrTooManyInputs, "limit [%d]", limits.MaxInputs)
+	}
 	for i, in := range t.Inputs {
 		if in == nil {
 			return errors.Errorf("invalid input at index [%d], empty input", i)
@@ -211,6 +231,9 @@ func (t *TransferAction) Validate() error {
 			return errors.Wrapf(err, "invalid input token at index [%d]", i)
 		}
 	}
+	if len(t.Outputs) > limits.MaxOutputs {
+		return errors.Wrapf(ErrTooManyOutputs, "limit [%d]", limits.MaxOutputs)
+	}
 	for i, out := range t.Outputs {
 		if out == nil {
 			return errors.Errorf("invalid output at index [%d], empty output", i)
@@ -221,6 +244,9 @@ func (t *TransferAction) Validate() error {
 		if len(out.Quantity) == 0 {
 			return errors.Errorf("invalid output's quantity at index [%d], output quantity is empty", i)
 		}
+	}
+	if err := checkMetadataLimits(t.Metadata, limits.MaxMetadataEntries, limits.MaxMetadataKeyBytes, limits.MaxMetadataValueBytes); err != nil {
+		return err
 	}
 	// The following check must happen only if the public parameters contain issuers.
 	// The validator enforces the signature of an issuer only in that case.
@@ -286,6 +312,18 @@ func (t *TransferAction) Deserialize(raw []byte) error {
 	// assert version
 	if action.Version != ProtocolV1 {
 		return errors.Errorf("invalid issue version, expected [%d], got [%d]", ProtocolV1, action.Version)
+	}
+
+	// enforce resource limits before any allocation proportional to attacker-controlled counts
+	limits := t.effectiveLimits()
+	if len(action.Inputs) > limits.MaxInputs {
+		return errors.Wrapf(ErrTooManyInputs, "limit [%d]", limits.MaxInputs)
+	}
+	if len(action.Outputs) > limits.MaxOutputs {
+		return errors.Wrapf(ErrTooManyOutputs, "limit [%d]", limits.MaxOutputs)
+	}
+	if err := checkMetadataLimits(action.Metadata, limits.MaxMetadataEntries, limits.MaxMetadataKeyBytes, limits.MaxMetadataValueBytes); err != nil {
+		return err
 	}
 
 	// inputs

@@ -24,6 +24,22 @@ type IssueAction struct {
 	Outputs []*Output
 	// metadata of the issue action
 	Metadata map[string][]byte
+
+	limits *driver.ResourceLimits
+}
+
+// SetLimits configures the resource limits enforced by Validate and Deserialize.
+func (i *IssueAction) SetLimits(limits driver.ResourceLimits) {
+	i.limits = &limits
+}
+
+// effectiveLimits returns the configured limits, or the defaults if none were set.
+func (i *IssueAction) effectiveLimits() driver.ResourceLimits {
+	if i.limits == nil {
+		return driver.DefaultResourceLimits()
+	}
+
+	return *i.limits
 }
 
 func (i *IssueAction) NumInputs() int {
@@ -81,6 +97,15 @@ func (i *IssueAction) Deserialize(raw []byte) error {
 	// assert version
 	if issueAction.Version != ProtocolV1 {
 		return errors.Errorf("invalid issue version, expected [%d], got [%d]", ProtocolV1, issueAction.Version)
+	}
+
+	// enforce resource limits before any allocation proportional to attacker-controlled counts
+	limits := i.effectiveLimits()
+	if len(issueAction.Outputs) > limits.MaxOutputs {
+		return errors.Wrapf(ErrTooManyOutputs, "limit [%d]", limits.MaxOutputs)
+	}
+	if err := checkMetadataLimits(issueAction.Metadata, limits.MaxMetadataEntries, limits.MaxMetadataKeyBytes, limits.MaxMetadataValueBytes); err != nil {
+		return err
 	}
 
 	// outputs
@@ -164,6 +189,10 @@ func (i *IssueAction) Validate() error {
 	if len(i.Outputs) == 0 {
 		return errors.Errorf("no outputs in issue action")
 	}
+	limits := i.effectiveLimits()
+	if len(i.Outputs) > limits.MaxOutputs {
+		return errors.Wrapf(ErrTooManyOutputs, "limit [%d]", limits.MaxOutputs)
+	}
 	for i, output := range i.Outputs {
 		if output == nil {
 			return errors.Errorf("nil output in issue action")
@@ -174,6 +203,9 @@ func (i *IssueAction) Validate() error {
 		if len(output.Quantity) == 0 {
 			return errors.Errorf("invalid output's quantity at index [%d], output quantity is empty", i)
 		}
+	}
+	if err := checkMetadataLimits(i.Metadata, limits.MaxMetadataEntries, limits.MaxMetadataKeyBytes, limits.MaxMetadataValueBytes); err != nil {
+		return err
 	}
 
 	return nil

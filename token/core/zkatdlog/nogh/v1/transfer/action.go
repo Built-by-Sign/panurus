@@ -134,6 +134,22 @@ type Action struct {
 	Metadata map[string][]byte
 	// Issuer contains the identity of the issuer to sign the transfer action
 	Issuer driver.Identity
+
+	limits *driver.ResourceLimits
+}
+
+// SetLimits configures the resource limits enforced by Validate and Deserialize.
+func (t *Action) SetLimits(limits driver.ResourceLimits) {
+	t.limits = &limits
+}
+
+// effectiveLimits returns the configured limits, or the defaults if none were set.
+func (t *Action) effectiveLimits() driver.ResourceLimits {
+	if t.limits == nil {
+		return driver.DefaultResourceLimits()
+	}
+
+	return *t.limits
 }
 
 // NewAction returns the Action that matches the passed arguments
@@ -335,6 +351,10 @@ func (t *Action) Validate() error {
 	if len(t.Inputs) == 0 {
 		return ErrInvalidInputs
 	}
+	limits := t.effectiveLimits()
+	if len(t.Inputs) > limits.MaxInputs {
+		return errors.Wrapf(ErrTooManyInputs, "limit [%d]", limits.MaxInputs)
+	}
 	for i, in := range t.Inputs {
 		if in == nil {
 			return errors.Wrapf(ErrEmptyInput, "invalid input at index [%d], empty input", i)
@@ -361,6 +381,9 @@ func (t *Action) Validate() error {
 	if len(t.Outputs) == 0 {
 		return ErrInvalidOutputs
 	}
+	if len(t.Outputs) > limits.MaxOutputs {
+		return errors.Wrapf(ErrTooManyOutputs, "limit [%d]", limits.MaxOutputs)
+	}
 	for i, out := range t.Outputs {
 		if out == nil {
 			return errors.Wrapf(ErrEmptyOutputToken, "invalid output token at index [%d]", i)
@@ -379,6 +402,12 @@ func (t *Action) Validate() error {
 	}
 	if len(t.Proof) == 0 {
 		return ErrEmptyProof
+	}
+	if len(t.Proof) > limits.MaxProofBytes {
+		return errors.Wrapf(ErrProofTooLarge, "limit [%d] bytes", limits.MaxProofBytes)
+	}
+	if err := checkMetadataLimits(t.Metadata, limits.MaxMetadataEntries, limits.MaxMetadataKeyBytes, limits.MaxMetadataValueBytes); err != nil {
+		return err
 	}
 
 	return nil
@@ -463,6 +492,23 @@ func (t *Action) Deserialize(raw []byte) error {
 	// assert version
 	if action.Version != ProtocolV1 {
 		return errors.Wrapf(ErrInvalidVersion, "expected [%d], got [%d]", ProtocolV1, action.Version)
+	}
+
+	// enforce resource limits before any allocation proportional to attacker-controlled counts
+	limits := t.effectiveLimits()
+	if len(action.Inputs) > limits.MaxInputs {
+		return errors.Wrapf(ErrTooManyInputs, "limit [%d]", limits.MaxInputs)
+	}
+	if len(action.Outputs) > limits.MaxOutputs {
+		return errors.Wrapf(ErrTooManyOutputs, "limit [%d]", limits.MaxOutputs)
+	}
+	if err := checkMetadataLimits(action.Metadata, limits.MaxMetadataEntries, limits.MaxMetadataKeyBytes, limits.MaxMetadataValueBytes); err != nil {
+		return err
+	}
+	if proof := action.GetProof(); proof != nil {
+		if len(proof.GetProof()) > limits.MaxProofBytes || len(proof.GetCspBasedProof()) > limits.MaxProofBytes {
+			return errors.Wrapf(ErrProofTooLarge, "limit [%d] bytes", limits.MaxProofBytes)
+		}
 	}
 
 	// inputs
