@@ -56,6 +56,10 @@ type TokenStore struct {
 	// keyed by argument shape (walletID present/absent, tokenType
 	// present/absent). See #1183.
 	unspentTokensStmts PreparedStmtHolder[string]
+
+	// spendableTokensStmts caches prepared statements for
+	// SpendableTokensIteratorBy, keyed the same way. See #1919.
+	spendableTokensStmts PreparedStmtHolder[string]
 }
 
 func newTokenStore(readDB, writeDB *sql.DB, tables tokenTables, ci common3.CondInterpreter, notifier driver.TokenNotifier, cleanupLeaderFactory func(context.Context, *sql.DB, int64) (driver.CleanupLeadership, bool, error)) *TokenStore {
@@ -68,6 +72,7 @@ func newTokenStore(readDB, writeDB *sql.DB, tables tokenTables, ci common3.CondI
 		cleanupLeaderFactory: cleanupLeaderFactory,
 	}
 	ts.unspentTokensStmts = newPreparedStmtHolder[string]()
+	ts.spendableTokensStmts = newPreparedStmtHolder[string]()
 
 	return ts
 }
@@ -365,8 +370,12 @@ func (it *dedupedTokenRowsIterator) Next() (*token.UnspentToken, error) {
 }
 
 // SpendableTokensIteratorBy returns the minimum information about the tokens needed for the selector
-func (db *TokenStore) SpendableTokensIteratorBy(ctx context.Context, walletID string, typ token.Type) (tdriver.SpendableTokensIterator, error) {
-	query, args := q.Select().
+// buildSpendableTokensIteratorByQuery builds the SQL query and args for
+// SpendableTokensIteratorBy without executing it. Extracted so benchmarks
+// can compare the dynamic path against a prepared-once path using identical
+// SQL (see #1919).
+func buildSpendableTokensIteratorByQuery(db *TokenStore, walletID string, typ token.Type) (string, []any) {
+	return q.Select().
 		FieldsByName("tx_id", "idx", "token_type", "quantity", "owner_wallet_id").
 		From(q.Table(db.table.Tokens)).
 		Where(HasTokenDetails(driver.QueryTokenDetailsParams{
@@ -376,9 +385,15 @@ func (db *TokenStore) SpendableTokensIteratorBy(ctx context.Context, walletID st
 			LedgerTokenFormats: db.getSupportedTokenFormats(),
 		}, nil)).
 		Format(db.ci)
+}
 
-	logging.Debug(logger, query, args)
-	rows, err := db.readDB.QueryContext(ctx, query, args...)
+func (db *TokenStore) SpendableTokensIteratorBy(ctx context.Context, walletID string, typ token.Type) (tdriver.SpendableTokensIterator, error) {
+	key := unspentTokensStmtKey(walletID, typ)
+	rows, err := db.spendableTokensStmts.Execute(ctx, db.readDB, key, func() (string, []any, error) {
+		query, args := buildSpendableTokensIteratorByQuery(db, walletID, typ)
+
+		return query, args, nil
+	})
 	if err != nil {
 		return nil, errors.Wrapf(err, "error querying db")
 	}
@@ -1427,6 +1442,7 @@ func (db *TokenStore) GetSchema() string {
 
 func (db *TokenStore) Close() error {
 	_ = db.unspentTokensStmts.Close()
+	_ = db.spendableTokensStmts.Close()
 
 	return common2.Close(db.readDB, db.writeDB)
 }
