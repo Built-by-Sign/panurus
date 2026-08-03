@@ -95,9 +95,13 @@ type IdentityAuditInfo struct {
 // It is a sequence of per-component audit infos in the same order as Identities.
 type AuditInfo struct {
 	IdentityAuditInfos []IdentityAuditInfo
+	// eid is the enrollment ID shared by all component identities, derived at
+	// deserialization time; empty when the components span enrollments or
+	// cannot be resolved.
+	eid string
 }
 
-func (a *AuditInfo) EnrollmentID() string     { return "" }
+func (a *AuditInfo) EnrollmentID() string     { return a.eid }
 func (a *AuditInfo) RevocationHandle() string { return "" }
 func (a *AuditInfo) Bytes() ([]byte, error)   { return json.Marshal(a) }
 

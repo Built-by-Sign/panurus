@@ -148,13 +148,56 @@ func (d *TypedIdentityDeserializer) Recipients(id driver.Identity, typ identity.
 
 // AuditInfoDeserializer deserialises raw audit info bytes into the AuditInfo
 // struct for the enrollment-ID / revocation-handle path.
-type AuditInfoDeserializer struct{}
+// When constructed with an inner deserializer, it also derives the policy
+// identity's enrollment ID as the enrollment ID shared by all components.
+type AuditInfoDeserializer struct {
+	AuditInfoDeserializer driver2.AuditInfoDeserializer
+}
 
-func (a *AuditInfoDeserializer) DeserializeAuditInfo(_ context.Context, _ driver.Identity, raw []byte) (driver2.AuditInfo, error) {
+// NewAuditInfoDeserializer returns an AuditInfoDeserializer that resolves the
+// per-component audit infos through inner, typically the parent multiplex
+// deserializer (mirroring the recursive htlc.NewAuditDeserializer pattern).
+func NewAuditInfoDeserializer(inner driver2.AuditInfoDeserializer) *AuditInfoDeserializer {
+	return &AuditInfoDeserializer{AuditInfoDeserializer: inner}
+}
+
+func (a *AuditInfoDeserializer) DeserializeAuditInfo(ctx context.Context, id driver.Identity, raw []byte) (driver2.AuditInfo, error) {
 	ei := &AuditInfo{}
 	if err := json.Unmarshal(raw, ei); err != nil {
 		return nil, err
 	}
+	ei.eid = a.commonEnrollmentID(ctx, id, ei)
 
 	return ei, nil
+}
+
+// commonEnrollmentID resolves each component's enrollment ID through the
+// inner deserializer and returns the value shared by all of them. It returns
+// "" (the legacy value) when there is no inner deserializer, the components
+// span enrollments, or any component cannot be resolved.
+func (a *AuditInfoDeserializer) commonEnrollmentID(ctx context.Context, id driver.Identity, ei *AuditInfo) string {
+	if a.AuditInfoDeserializer == nil || len(ei.IdentityAuditInfos) == 0 {
+		return ""
+	}
+	pi := PolicyIdentity{}
+	if err := pi.Deserialize(id); err != nil {
+		return ""
+	}
+	if len(pi.Identities) != len(ei.IdentityAuditInfos) {
+		return ""
+	}
+	eid := ""
+	for k, info := range ei.IdentityAuditInfos {
+		memberAuditInfo, err := a.AuditInfoDeserializer.DeserializeAuditInfo(ctx, pi.Identities[k], info.AuditInfo)
+		if err != nil {
+			return ""
+		}
+		memberEID := memberAuditInfo.EnrollmentID()
+		if memberEID == "" || (eid != "" && memberEID != eid) {
+			return ""
+		}
+		eid = memberEID
+	}
+
+	return eid
 }
