@@ -685,6 +685,9 @@ func (r *Request) extractIssueOutputs(ctx context.Context, i int, counter uint64
 				LedgerOutputMetadata: issueMeta.Outputs[j].OutputMetadata,
 			})
 		} else {
+			// one accounting row per (output, enrollment ID): recipients of a
+			// composite owner sharing an enrollment must not multiply the amount
+			seenEIDs := map[string]bool{}
 			for k, recipient := range recipients {
 				metaRecipient := issueMeta.Outputs[j].RecipientAt(k)
 				if metaRecipient == nil {
@@ -697,6 +700,10 @@ func (r *Request) extractIssueOutputs(ctx context.Context, i int, counter uint64
 				if err != nil {
 					return nil, 0, errors.Wrapf(err, "failed getting enrollment id and revocation handle [%d,%d]", i, j)
 				}
+				if eID != "" && seenEIDs[eID] {
+					continue
+				}
+				seenEIDs[eID] = true
 
 				outputs = append(outputs, &Output{
 					Token:                *tok,
@@ -810,6 +817,9 @@ func (r *Request) extractTransferOutputs(ctx context.Context, i int, counter uin
 				}
 			}
 		} else {
+			// one accounting row per (output, enrollment ID): recipients of a
+			// composite owner sharing an enrollment must not multiply the amount
+			seenEIDs := map[string]bool{}
 			for k, recipient := range recipients {
 				metaRecipient := transferMeta.Outputs[j].RecipientAt(k)
 				if metaRecipient == nil {
@@ -830,6 +840,10 @@ func (r *Request) extractTransferOutputs(ctx context.Context, i int, counter uin
 					}
 					targetLedgerOutput = ledgerOutput
 				}
+				if eID != "" && seenEIDs[eID] {
+					continue
+				}
+				seenEIDs[eID] = true
 				r.TokenService.logger.Debugf("Transfer Action Output [%d,%d][%s:%d] is present, extract [%s]", i, j, r.Anchor, counter, Hashable(ledgerOutput))
 				outputs = append(outputs, &Output{
 					Token:                *tok,
