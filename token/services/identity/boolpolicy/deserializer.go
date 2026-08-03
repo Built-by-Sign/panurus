@@ -151,14 +151,14 @@ func (d *TypedIdentityDeserializer) Recipients(id driver.Identity, typ identity.
 // When constructed with an inner deserializer, it also derives the policy
 // identity's enrollment ID as the enrollment ID shared by all components.
 type AuditInfoDeserializer struct {
-	AuditInfoDeserializer driver2.AuditInfoDeserializer
+	inner driver2.AuditInfoDeserializer
 }
 
 // NewAuditInfoDeserializer returns an AuditInfoDeserializer that resolves the
 // per-component audit infos through inner, typically the parent multiplex
 // deserializer (mirroring the recursive htlc.NewAuditDeserializer pattern).
 func NewAuditInfoDeserializer(inner driver2.AuditInfoDeserializer) *AuditInfoDeserializer {
-	return &AuditInfoDeserializer{AuditInfoDeserializer: inner}
+	return &AuditInfoDeserializer{inner: inner}
 }
 
 func (a *AuditInfoDeserializer) DeserializeAuditInfo(ctx context.Context, id driver.Identity, raw []byte) (driver2.AuditInfo, error) {
@@ -176,7 +176,7 @@ func (a *AuditInfoDeserializer) DeserializeAuditInfo(ctx context.Context, id dri
 // "" (the legacy value) when there is no inner deserializer, the components
 // span enrollments, or any component cannot be resolved.
 func (a *AuditInfoDeserializer) commonEnrollmentID(ctx context.Context, id driver.Identity, ei *AuditInfo) string {
-	if a.AuditInfoDeserializer == nil || len(ei.IdentityAuditInfos) == 0 {
+	if a.inner == nil || len(ei.IdentityAuditInfos) == 0 {
 		return ""
 	}
 	pi := PolicyIdentity{}
@@ -188,7 +188,7 @@ func (a *AuditInfoDeserializer) commonEnrollmentID(ctx context.Context, id drive
 	}
 	eid := ""
 	for k, info := range ei.IdentityAuditInfos {
-		memberAuditInfo, err := a.AuditInfoDeserializer.DeserializeAuditInfo(ctx, pi.Identities[k], info.AuditInfo)
+		memberAuditInfo, err := a.inner.DeserializeAuditInfo(ctx, pi.Identities[k], info.AuditInfo)
 		if err != nil {
 			return ""
 		}

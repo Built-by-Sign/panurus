@@ -102,21 +102,31 @@ func newCompositeTransferRequest(t *testing.T, ws *driver2.WalletService) *Reque
 	}
 }
 
-// TestRequest_Outputs_CompositeSameEIDSingleRow checks that the members of a
-// composite owner sharing one enrollment ID produce a single accounting row,
+// TestRequest_Outputs_CompositeSameEIDKeepsMemberRows checks that every
+// member of a composite owner keeps its own output row (identity and
+// revocation handle stay visible), while UniquePerOutput collapses the rows
 // so eid-keyed sums count the output amount exactly once.
-func TestRequest_Outputs_CompositeSameEIDSingleRow(t *testing.T) {
+func TestRequest_Outputs_CompositeSameEIDKeepsMemberRows(t *testing.T) {
 	ws := &driver2.WalletService{}
-	ws.GetEIDAndRHReturns("wallet-42", "", nil)
+	ws.GetEIDAndRHReturnsOnCall(0, "wallet-42", "rh-0", nil)
+	ws.GetEIDAndRHReturnsOnCall(1, "wallet-42", "rh-1", nil)
 
 	outputs, err := newCompositeTransferRequest(t, ws).Outputs(t.Context())
 	require.NoError(t, err)
 
-	require.Equal(t, 1, outputs.Count())
-	out := outputs.At(0)
-	assert.Equal(t, "wallet-42", out.EnrollmentID)
-	assert.Equal(t, "40", out.Quantity.Decimal())
-	assert.Equal(t, "40", outputs.ByEnrollmentID("wallet-42").Sum().String())
+	// one row per member, same physical output index
+	require.Equal(t, 2, outputs.Count())
+	assert.Equal(t, "wallet-42", outputs.At(0).EnrollmentID)
+	assert.Equal(t, "wallet-42", outputs.At(1).EnrollmentID)
+	assert.Equal(t, outputs.At(0).Index, outputs.At(1).Index)
+
+	// identity consumers still see every member
+	assert.Equal(t, 1, outputs.ByRecipient(Identity("member-0")).Count())
+	assert.Equal(t, 1, outputs.ByRecipient(Identity("member-1")).Count())
+	assert.Equal(t, []string{"rh-0", "rh-1"}, outputs.RevocationHandles())
+
+	// economic view counts the amount once
+	assert.Equal(t, "40", outputs.ByEnrollmentID("wallet-42").UniquePerOutput().Sum().String())
 }
 
 // TestRequest_Outputs_CompositeDistinctEIDsKeepRows checks that members
@@ -198,17 +208,17 @@ func newCompositeIssueRequest(t *testing.T, ws *driver2.WalletService) *Request 
 	}
 }
 
-// TestRequest_Outputs_IssueCompositeSameEIDSingleRow is the issue-side twin
-// of TestRequest_Outputs_CompositeSameEIDSingleRow.
-func TestRequest_Outputs_IssueCompositeSameEIDSingleRow(t *testing.T) {
+// TestRequest_Outputs_IssueCompositeSameEIDKeepsMemberRows is the issue-side
+// twin of TestRequest_Outputs_CompositeSameEIDKeepsMemberRows.
+func TestRequest_Outputs_IssueCompositeSameEIDKeepsMemberRows(t *testing.T) {
 	ws := &driver2.WalletService{}
-	ws.GetEIDAndRHReturns("wallet-42", "", nil)
+	ws.GetEIDAndRHReturnsOnCall(0, "wallet-42", "rh-0", nil)
+	ws.GetEIDAndRHReturnsOnCall(1, "wallet-42", "rh-1", nil)
 
 	outputs, err := newCompositeIssueRequest(t, ws).Outputs(t.Context())
 	require.NoError(t, err)
 
-	require.Equal(t, 1, outputs.Count())
-	out := outputs.At(0)
-	assert.Equal(t, "wallet-42", out.EnrollmentID)
-	assert.Equal(t, "40", out.Quantity.Decimal())
+	require.Equal(t, 2, outputs.Count())
+	assert.Equal(t, []string{"rh-0", "rh-1"}, outputs.RevocationHandles())
+	assert.Equal(t, "40", outputs.ByEnrollmentID("wallet-42").UniquePerOutput().Sum().String())
 }

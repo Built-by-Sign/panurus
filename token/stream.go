@@ -91,6 +91,29 @@ func (o *OutputStream) ByType(typ token.Type) *OutputStream {
 	})
 }
 
+// UniquePerOutput returns a stream keeping, for each (Index, EnrollmentID)
+// pair, only the first output. A composite owner is expanded into one output
+// per member; members sharing an enrollment ID all carry the full amount, so
+// amount aggregation (Sum) must collapse them to a single row first. Identity
+// consumers (ByRecipient, RevocationHandles) use the full stream instead.
+func (o *OutputStream) UniquePerOutput() *OutputStream {
+	type key struct {
+		index uint64
+		eID   string
+	}
+	seen := map[key]bool{}
+
+	return o.Filter(func(t *Output) bool {
+		k := key{index: t.Index, eID: t.EnrollmentID}
+		if seen[k] {
+			return false
+		}
+		seen[k] = true
+
+		return true
+	})
+}
+
 // IsRedeem returns true if this output is a redeem, i.e., it has no owner.
 func (o *Output) IsRedeem() bool {
 	return len(o.Owner) == 0
