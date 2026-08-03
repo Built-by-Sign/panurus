@@ -83,36 +83,38 @@ func TestPolicyEnrollmentIDConflictingMembers(t *testing.T) {
 }
 
 func TestPolicyEnrollmentIDEmptyMemberEID(t *testing.T) {
+	// malformed: a resolvable member whose enrollment ID is empty
 	m0, ai0 := newX509Member(t, "cert-zero", "")
 	policyID, wrapped := newPolicyIdentity(t, [][]byte{m0}, [][]byte{ai0})
 
-	eid, _, err := newEIDRHDeserializer().GetEIDAndRH(t.Context(), policyID, wrapped)
-	require.NoError(t, err)
-	assert.Equal(t, "", eid)
+	_, _, err := newEIDRHDeserializer().GetEIDAndRH(t.Context(), policyID, wrapped)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "empty enrollment ID")
 }
 
 func TestPolicyEnrollmentIDUnresolvableMember(t *testing.T) {
-	// member typed with an identity type that has no registered deserializer
+	// malformed: member typed with an identity type that has no registered
+	// deserializer
 	m0, err := identity.WrapWithType(identity.Type(99), []byte("cert-zero"))
 	require.NoError(t, err)
 	ai0, err := (&x509.AuditInfo{EID: "wallet-42"}).Bytes()
 	require.NoError(t, err)
 	policyID, wrapped := newPolicyIdentity(t, [][]byte{m0}, [][]byte{ai0})
 
-	eid, _, err := newEIDRHDeserializer().GetEIDAndRH(t.Context(), policyID, wrapped)
-	require.NoError(t, err)
-	assert.Equal(t, "", eid)
+	_, _, err = newEIDRHDeserializer().GetEIDAndRH(t.Context(), policyID, wrapped)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to deserialize audit info of component")
 }
 
 func TestPolicyEnrollmentIDMemberCountMismatch(t *testing.T) {
+	// malformed: two members but a single component audit info
 	m0, ai0 := newX509Member(t, "cert-zero", "wallet-42")
 	m1, _ := newX509Member(t, "cert-one", "wallet-42")
-	// two members but a single component audit info
 	policyID, wrapped := newPolicyIdentity(t, [][]byte{m0, m1}, [][]byte{ai0})
 
-	eid, _, err := newEIDRHDeserializer().GetEIDAndRH(t.Context(), policyID, wrapped)
-	require.NoError(t, err)
-	assert.Equal(t, "", eid)
+	_, _, err := newEIDRHDeserializer().GetEIDAndRH(t.Context(), policyID, wrapped)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "component audit infos")
 }
 
 func TestPolicyEnrollmentIDZeroValueDeserializer(t *testing.T) {

@@ -166,38 +166,49 @@ func (a *AuditInfoDeserializer) DeserializeAuditInfo(ctx context.Context, id dri
 	if err := json.Unmarshal(raw, ei); err != nil {
 		return nil, err
 	}
-	ei.eid = a.commonEnrollmentID(ctx, id, ei)
+	eid, err := a.commonEnrollmentID(ctx, id, ei)
+	if err != nil {
+		return nil, errors.WithMessagef(err, "failed deriving policy enrollment ID")
+	}
+	ei.eid = eid
 
 	return ei, nil
 }
 
 // commonEnrollmentID resolves each component's enrollment ID through the
-// inner deserializer and returns the value shared by all of them. It returns
-// "" (the legacy value) when there is no inner deserializer, the components
-// span enrollments, or any component cannot be resolved.
-func (a *AuditInfoDeserializer) commonEnrollmentID(ctx context.Context, id driver.Identity, ei *AuditInfo) string {
-	if a.inner == nil || len(ei.IdentityAuditInfos) == 0 {
-		return ""
+// inner deserializer and returns the value shared by all of them. Components
+// legitimately spanning enrollments yield "" (the legacy value, also the only
+// behavior of the zero-value deserializer); malformed audit info — an
+// unresolvable component, an empty component enrollment ID, or a component
+// count mismatch — is an error, not a silent "".
+func (a *AuditInfoDeserializer) commonEnrollmentID(ctx context.Context, id driver.Identity, ei *AuditInfo) (string, error) {
+	if a.inner == nil {
+		return "", nil
 	}
 	pi := PolicyIdentity{}
 	if err := pi.Deserialize(id); err != nil {
-		return ""
+		return "", errors.Wrapf(err, "failed to deserialize policy identity")
 	}
 	if len(pi.Identities) != len(ei.IdentityAuditInfos) {
-		return ""
+		return "", errors.Errorf("expected %d component audit infos but received %d",
+			len(pi.Identities), len(ei.IdentityAuditInfos))
 	}
 	eid := ""
 	for k, info := range ei.IdentityAuditInfos {
 		memberAuditInfo, err := a.inner.DeserializeAuditInfo(ctx, pi.Identities[k], info.AuditInfo)
 		if err != nil {
-			return ""
+			return "", errors.Wrapf(err, "failed to deserialize audit info of component [%d]", k)
 		}
 		memberEID := memberAuditInfo.EnrollmentID()
-		if memberEID == "" || (eid != "" && memberEID != eid) {
-			return ""
+		if memberEID == "" {
+			return "", errors.Errorf("component [%d] has an empty enrollment ID", k)
+		}
+		if eid != "" && memberEID != eid {
+			// components span enrollments: legal, there is no common EID
+			return "", nil
 		}
 		eid = memberEID
 	}
 
-	return eid
+	return eid, nil
 }
