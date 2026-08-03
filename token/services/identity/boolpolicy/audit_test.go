@@ -141,3 +141,31 @@ func TestPolicyAuditInfoGarbageStillErrors(t *testing.T) {
 	_, _, err = newEIDRHDeserializer().GetEIDAndRH(t.Context(), policyID, []byte("not-json"))
 	require.Error(t, err)
 }
+
+func TestPolicyEnrollmentIDCrossEIDThenCorruptedMember(t *testing.T) {
+	// members legitimately span enrollments, but a later member is
+	// unresolvable: the corruption must surface as an error, not be masked
+	// by the cross-enrollment "" result
+	m0, ai0 := newX509Member(t, "cert-zero", "wallet-42")
+	m1, ai1 := newX509Member(t, "cert-one", "wallet-43")
+	m2, err := identity.WrapWithType(identity.Type(99), []byte("cert-two"))
+	require.NoError(t, err)
+	ai2, err := (&x509.AuditInfo{EID: "wallet-44"}).Bytes()
+	require.NoError(t, err)
+	policyID, wrapped := newPolicyIdentity(t, [][]byte{m0, m1, m2}, [][]byte{ai0, ai1, ai2})
+
+	_, _, err = newEIDRHDeserializer().GetEIDAndRH(t.Context(), policyID, wrapped)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to deserialize audit info of component")
+}
+
+func TestPolicyEnrollmentIDCrossEIDThenEmptyMemberEID(t *testing.T) {
+	m0, ai0 := newX509Member(t, "cert-zero", "wallet-42")
+	m1, ai1 := newX509Member(t, "cert-one", "wallet-43")
+	m2, ai2 := newX509Member(t, "cert-two", "")
+	policyID, wrapped := newPolicyIdentity(t, [][]byte{m0, m1, m2}, [][]byte{ai0, ai1, ai2})
+
+	_, _, err := newEIDRHDeserializer().GetEIDAndRH(t.Context(), policyID, wrapped)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "empty enrollment ID")
+}

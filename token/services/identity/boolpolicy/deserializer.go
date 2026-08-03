@@ -194,6 +194,7 @@ func (a *AuditInfoDeserializer) commonEnrollmentID(ctx context.Context, id drive
 			len(pi.Identities), len(ei.IdentityAuditInfos))
 	}
 	eid := ""
+	spansEnrollments := false
 	for k, info := range ei.IdentityAuditInfos {
 		memberAuditInfo, err := a.inner.DeserializeAuditInfo(ctx, pi.Identities[k], info.AuditInfo)
 		if err != nil {
@@ -203,11 +204,15 @@ func (a *AuditInfoDeserializer) commonEnrollmentID(ctx context.Context, id drive
 		if memberEID == "" {
 			return "", errors.Errorf("component [%d] has an empty enrollment ID", k)
 		}
-		if eid != "" && memberEID != eid {
-			// components span enrollments: legal, there is no common EID
-			return "", nil
+		if eid == "" {
+			eid = memberEID
+		} else if memberEID != eid {
+			spansEnrollments = true
 		}
-		eid = memberEID
+	}
+	if spansEnrollments {
+		// components span enrollments: legal, there is no common EID
+		return "", nil
 	}
 
 	return eid, nil

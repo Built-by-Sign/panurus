@@ -96,8 +96,8 @@ type IdentityAuditInfo struct {
 type AuditInfo struct {
 	IdentityAuditInfos []IdentityAuditInfo
 	// eid is the enrollment ID shared by all component identities, derived at
-	// deserialization time; empty when the components span enrollments or
-	// cannot be resolved.
+	// deserialization time; empty only when the components legitimately span
+	// enrollments (malformed component audit info fails deserialization).
 	eid string
 }
 
