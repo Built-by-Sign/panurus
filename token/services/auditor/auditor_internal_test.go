@@ -293,7 +293,7 @@ func TestRequestWrapper_CompleteInputsWithEmptyEID_WithInputs(t *testing.T) {
 		{Type: "USD", Quantity: "100", Owner: []byte("owner1")},
 	})
 	ws.GetAuditInfoReturns([]byte("owner1-audit-info"), nil)
-	ws.GetEnrollmentIDReturns("owner1-eid", nil)
+	ws.GetEIDAndRHReturns("owner1-eid", "owner1-rh", nil)
 	rw := newRequestWrapper(
 		token.NewRequest(tmsWithToken, token.RequestAnchor("tx-cid2")), tmsWithToken,
 	)
@@ -308,8 +308,33 @@ func TestRequestWrapper_CompleteInputsWithEmptyEID_WithInputs(t *testing.T) {
 	// first output's enrollment ID
 	in := recordWithInputs.Inputs.At(0)
 	assert.Equal(t, "owner1-eid", in.EnrollmentID)
+	assert.Equal(t, "owner1-rh", in.RevocationHandler)
 	assert.Equal(t, token2.Type("USD"), in.Type)
 	assert.Equal(t, "100", in.Quantity.Decimal())
+}
+
+func TestRequestWrapper_CompleteInputsWithEmptyEID_UsesRecordAuditInfo(t *testing.T) {
+	tmsWithToken, ws := newInternalTestManagementServiceWithTokens(t, []*token2.Token{
+		{Type: "USD", Quantity: "100", Owner: []byte("owner1")},
+	})
+	ws.GetEIDAndRHReturns("owner1-eid", "owner1-rh", nil)
+	rw := newRequestWrapper(
+		token.NewRequest(tmsWithToken, token.RequestAnchor("tx-cid3")), tmsWithToken,
+	)
+	record := &token.AuditRecord{
+		Inputs: token.NewInputStream(nil, []*token.Input{
+			{Id: &token2.ID{TxId: "123"}, OwnerAuditInfo: []byte("carried-audit-info")},
+		}, 0),
+		Outputs: token.NewOutputStream([]*token.Output{{EnrollmentID: "target"}}, 0),
+	}
+	err := rw.completeInputsWithEmptyEID(context.Background(), record)
+	assert.NoError(t, err)
+
+	// the record-carried audit info is used directly: no local lookup
+	assert.Equal(t, 0, ws.GetAuditInfoCallCount())
+	_, _, auditInfo := ws.GetEIDAndRHArgsForCall(0)
+	assert.Equal(t, []byte("carried-audit-info"), auditInfo)
+	assert.Equal(t, "owner1-eid", record.Inputs.At(0).EnrollmentID)
 }
 
 func TestCompleteInputsWithEmptyEID_UnresolvableOwnerFailsClosed(t *testing.T) {
@@ -317,7 +342,7 @@ func TestCompleteInputsWithEmptyEID_UnresolvableOwnerFailsClosed(t *testing.T) {
 		{Type: "USD", Quantity: "100", Owner: []byte("owner1")},
 	})
 	ws.GetAuditInfoReturns([]byte("owner1-audit-info"), nil)
-	ws.GetEnrollmentIDReturns("", nil)
+	ws.GetEIDAndRHReturns("", "", nil)
 	rw := newRequestWrapper(
 		token.NewRequest(tmsWithToken, token.RequestAnchor("tx-unres")), tmsWithToken,
 	)
@@ -426,7 +451,7 @@ func TestCompleteInputsWithEmptyEID_ToQuantityError(t *testing.T) {
 	mockPPM.PublicParametersReturns(mockPP)
 	mockWS := &drivermock.WalletService{}
 	mockWS.GetAuditInfoReturns([]byte("owner1-audit-info"), nil)
-	mockWS.GetEnrollmentIDReturns("owner1-eid", nil)
+	mockWS.GetEIDAndRHReturns("owner1-eid", "owner1-rh", nil)
 	mockTMS.PublicParamsManagerReturns(mockPPM)
 	mockTMS.ValidatorReturns(&drivermock.Validator{}, nil)
 	mockTMS.TokensServiceReturns(&drivermock.TokensService{})
@@ -479,7 +504,7 @@ func TestRequestWrapper_AuditRecord_CachedStillFillsGaps(t *testing.T) {
 		{Type: "USD", Quantity: "100", Owner: []byte("owner1")},
 	})
 	ws.GetAuditInfoReturns([]byte("owner1-audit-info"), nil)
-	ws.GetEnrollmentIDReturns("owner1-eid", nil)
+	ws.GetEIDAndRHReturns("owner1-eid", "owner1-rh", nil)
 	rw := newRequestWrapper(token.NewRequest(tms, token.RequestAnchor("tx-cache-gaps")), tms)
 	rw.cached = &token.AuditRecord{
 		Inputs:  token.NewInputStream(nil, []*token.Input{{Id: &token2.ID{TxId: "123"}}}, 0),

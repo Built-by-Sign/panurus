@@ -415,9 +415,10 @@ func (r *requestWrapper) AuditRecord(ctx context.Context) (*token.AuditRecord, e
 
 // completeInputsWithEmptyEID fills in missing enrollment ID information for inputs in the audit record
 // by querying the token vault. This is necessary when inputs don't have enrollment IDs explicitly set.
-// Each input is attributed to the enrollment ID resolved from its own token's
-// owner; an input that cannot be attributed fails the audit record instead of
-// being booked under a guessed enrollment ID.
+// Each input is attributed to the enrollment ID resolved from its own token
+// owner and the audit info carried by the record (falling back to the locally
+// stored audit info); an input that cannot be attributed fails the audit
+// record instead of being booked under a guessed enrollment ID.
 func (r *requestWrapper) completeInputsWithEmptyEID(ctx context.Context, record *token.AuditRecord) error {
 	filter := record.Inputs.ByEnrollmentID("")
 	if filter.Count() == 0 {
@@ -433,14 +434,6 @@ func (r *requestWrapper) completeInputsWithEmptyEID(ctx context.Context, record 
 	wm := r.tms.WalletManager()
 	for i := range filter.Count() {
 		item := filter.At(i)
-		eID, err := wm.GetEnrollmentID(ctx, tokens[i].Owner)
-		if err != nil {
-			return errors.WithMessagef(err, "failed resolving enrollment id for input [%v]", item.Id)
-		}
-		if eID == "" {
-			return errors.Errorf("cannot attribute input [%v] to an enrollment ID", item.Id)
-		}
-		item.EnrollmentID = eID
 		item.Owner = tokens[i].Owner
 		item.Type = tokens[i].Type
 		q, err := token2.ToQuantity(tokens[i].Quantity, precision)
@@ -448,6 +441,16 @@ func (r *requestWrapper) completeInputsWithEmptyEID(ctx context.Context, record 
 			return errors.WithMessagef(err, "failed converting token quantity [%s]", tokens[i].Quantity)
 		}
 		item.Quantity = q
+
+		eID, rID, err := wm.GetEIDAndRH(ctx, item.Owner, item.OwnerAuditInfo)
+		if err != nil {
+			return errors.WithMessagef(err, "failed resolving enrollment id for input [%v]", item.Id)
+		}
+		if eID == "" {
+			return errors.Errorf("cannot attribute input [%v] to an enrollment ID", item.Id)
+		}
+		item.EnrollmentID = eID
+		item.RevocationHandler = rID
 	}
 
 	return nil
