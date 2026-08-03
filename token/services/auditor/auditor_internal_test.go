@@ -216,7 +216,7 @@ func TestMetricsProviderCall(t *testing.T) {
 // newInternalTestTMS builds a ManagementService backed by driver mocks whose
 // query engine returns toks; the query engine is also returned so tests can
 // count vault accesses.
-func newInternalTestTMS(t *testing.T, toks []*token2.Token) (*token.ManagementService, *drivermock.QueryEngine) {
+func newInternalTestTMS(t *testing.T, toks []*token2.Token) (*token.ManagementService, *drivermock.QueryEngine, *drivermock.WalletService) {
 	t.Helper()
 	mockTMS := &drivermock.TokenManagerService{}
 	mockVP := &tokenmock.VaultProvider{}
@@ -228,9 +228,10 @@ func newInternalTestTMS(t *testing.T, toks []*token2.Token) (*token.ManagementSe
 	mockPP.PrecisionReturns(64)
 	mockPPM.PublicParametersReturns(mockPP)
 
+	mockWS := &drivermock.WalletService{}
 	mockTMS.PublicParamsManagerReturns(mockPPM)
 	mockTMS.TokensServiceReturns(&drivermock.TokensService{})
-	mockTMS.WalletServiceReturns(&drivermock.WalletService{})
+	mockTMS.WalletServiceReturns(mockWS)
 	mockTMS.IssueServiceReturns(&drivermock.IssueService{})
 	mockTMS.TransferServiceReturns(&drivermock.TransferService{})
 
@@ -251,21 +252,21 @@ func newInternalTestTMS(t *testing.T, toks []*token2.Token) (*token.ManagementSe
 	require.NoError(t, err)
 	require.NotNil(t, tms)
 
-	return tms, mockQE
+	return tms, mockQE, mockWS
 }
 
 func newInternalTestManagementService(t *testing.T) *token.ManagementService {
 	t.Helper()
-	tms, _ := newInternalTestTMS(t, []*token2.Token{})
+	tms, _, _ := newInternalTestTMS(t, []*token2.Token{})
 
 	return tms
 }
 
-func newInternalTestManagementServiceWithTokens(t *testing.T, toks []*token2.Token) *token.ManagementService {
+func newInternalTestManagementServiceWithTokens(t *testing.T, toks []*token2.Token) (*token.ManagementService, *drivermock.WalletService) {
 	t.Helper()
-	tms, _ := newInternalTestTMS(t, toks)
+	tms, _, ws := newInternalTestTMS(t, toks)
 
-	return tms
+	return tms, ws
 }
 
 func TestRequestWrapper_PublicParamsHash(t *testing.T) {
@@ -288,9 +289,11 @@ func TestRequestWrapper_CompleteInputsWithEmptyEID_Shortcut(t *testing.T) {
 }
 
 func TestRequestWrapper_CompleteInputsWithEmptyEID_WithInputs(t *testing.T) {
-	tmsWithToken := newInternalTestManagementServiceWithTokens(t, []*token2.Token{
+	tmsWithToken, ws := newInternalTestManagementServiceWithTokens(t, []*token2.Token{
 		{Type: "USD", Quantity: "100", Owner: []byte("owner1")},
 	})
+	ws.GetAuditInfoReturns([]byte("owner1-audit-info"), nil)
+	ws.GetEnrollmentIDReturns("owner1-eid", nil)
 	rw := newRequestWrapper(
 		token.NewRequest(tmsWithToken, token.RequestAnchor("tx-cid2")), tmsWithToken,
 	)
@@ -300,6 +303,49 @@ func TestRequestWrapper_CompleteInputsWithEmptyEID_WithInputs(t *testing.T) {
 	}
 	err := rw.completeInputsWithEmptyEID(context.Background(), recordWithInputs)
 	assert.NoError(t, err)
+
+	// the input is attributed to its own token's owner, never to the
+	// first output's enrollment ID
+	in := recordWithInputs.Inputs.At(0)
+	assert.Equal(t, "owner1-eid", in.EnrollmentID)
+	assert.Equal(t, token2.Type("USD"), in.Type)
+	assert.Equal(t, "100", in.Quantity.Decimal())
+}
+
+func TestCompleteInputsWithEmptyEID_UnresolvableOwnerFailsClosed(t *testing.T) {
+	tmsWithToken, ws := newInternalTestManagementServiceWithTokens(t, []*token2.Token{
+		{Type: "USD", Quantity: "100", Owner: []byte("owner1")},
+	})
+	ws.GetAuditInfoReturns([]byte("owner1-audit-info"), nil)
+	ws.GetEnrollmentIDReturns("", nil)
+	rw := newRequestWrapper(
+		token.NewRequest(tmsWithToken, token.RequestAnchor("tx-unres")), tmsWithToken,
+	)
+	record := &token.AuditRecord{
+		Inputs:  token.NewInputStream(nil, []*token.Input{{Id: &token2.ID{TxId: "123"}}}, 0),
+		Outputs: token.NewOutputStream([]*token.Output{{EnrollmentID: "target"}}, 0),
+	}
+	err := rw.completeInputsWithEmptyEID(context.Background(), record)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cannot attribute input")
+	assert.Equal(t, "", record.Inputs.At(0).EnrollmentID)
+}
+
+func TestCompleteInputsWithEmptyEID_OwnerResolutionErrorPropagates(t *testing.T) {
+	tmsWithToken, ws := newInternalTestManagementServiceWithTokens(t, []*token2.Token{
+		{Type: "USD", Quantity: "100", Owner: []byte("owner1")},
+	})
+	ws.GetAuditInfoReturns(nil, errors.New("no audit info stored"))
+	rw := newRequestWrapper(
+		token.NewRequest(tmsWithToken, token.RequestAnchor("tx-res-err")), tmsWithToken,
+	)
+	record := &token.AuditRecord{
+		Inputs:  token.NewInputStream(nil, []*token.Input{{Id: &token2.ID{TxId: "123"}}}, 0),
+		Outputs: token.NewOutputStream([]*token.Output{{EnrollmentID: "target"}}, 0),
+	}
+	err := rw.completeInputsWithEmptyEID(context.Background(), record)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed resolving enrollment id")
 }
 
 func TestRequestWrapper_AuditRecord(t *testing.T) {
@@ -378,10 +424,13 @@ func TestCompleteInputsWithEmptyEID_ToQuantityError(t *testing.T) {
 	mockPP := &drivermock.PublicParameters{}
 	mockPP.PrecisionReturns(64)
 	mockPPM.PublicParametersReturns(mockPP)
+	mockWS := &drivermock.WalletService{}
+	mockWS.GetAuditInfoReturns([]byte("owner1-audit-info"), nil)
+	mockWS.GetEnrollmentIDReturns("owner1-eid", nil)
 	mockTMS.PublicParamsManagerReturns(mockPPM)
 	mockTMS.ValidatorReturns(&drivermock.Validator{}, nil)
 	mockTMS.TokensServiceReturns(&drivermock.TokensService{})
-	mockTMS.WalletServiceReturns(&drivermock.WalletService{})
+	mockTMS.WalletServiceReturns(mockWS)
 	mockTMS.IssueServiceReturns(&drivermock.IssueService{})
 	mockTMS.TransferServiceReturns(&drivermock.TransferService{})
 
@@ -426,9 +475,11 @@ func TestRequestWrapper_AuditRecord_ReusesCached(t *testing.T) {
 }
 
 func TestRequestWrapper_AuditRecord_CachedStillFillsGaps(t *testing.T) {
-	tms := newInternalTestManagementServiceWithTokens(t, []*token2.Token{
+	tms, ws := newInternalTestManagementServiceWithTokens(t, []*token2.Token{
 		{Type: "USD", Quantity: "100", Owner: []byte("owner1")},
 	})
+	ws.GetAuditInfoReturns([]byte("owner1-audit-info"), nil)
+	ws.GetEnrollmentIDReturns("owner1-eid", nil)
 	rw := newRequestWrapper(token.NewRequest(tms, token.RequestAnchor("tx-cache-gaps")), tms)
 	rw.cached = &token.AuditRecord{
 		Inputs:  token.NewInputStream(nil, []*token.Input{{Id: &token2.ID{TxId: "123"}}}, 0),
@@ -438,7 +489,7 @@ func TestRequestWrapper_AuditRecord_CachedStillFillsGaps(t *testing.T) {
 	record, err := rw.AuditRecord(context.Background())
 	require.NoError(t, err)
 	in := record.Inputs.At(0)
-	assert.Equal(t, "target", in.EnrollmentID)
+	assert.Equal(t, "owner1-eid", in.EnrollmentID)
 	assert.Equal(t, token2.Type("USD"), in.Type)
 }
 
@@ -527,7 +578,7 @@ func (s *stubTMSProvider) TokenManagementService(...token.ServiceOption) (dep.To
 // accesses performed to compute an audit record.
 func newAuditTestService(t *testing.T) (*Service, *drivermock.QueryEngine, *token.ManagementService) {
 	t.Helper()
-	tms, qe := newInternalTestTMS(t, []*token2.Token{})
+	tms, qe, _ := newInternalTestTMS(t, []*token2.Token{})
 
 	auditDB, err := auditdb.NewStoreService(&stubAuditStore{})
 	require.NoError(t, err)
@@ -544,7 +595,7 @@ func newAuditTestService(t *testing.T) (*Service, *drivermock.QueryEngine, *toke
 }
 
 func TestSnapshotAuditRecord_IsolatedFromOriginal(t *testing.T) {
-	tms, _ := newInternalTestTMS(t, []*token2.Token{})
+	tms, _, _ := newInternalTestTMS(t, []*token2.Token{})
 	req := token.NewRequest(tms, "tx-snapshot")
 	quantity, err := token2.ToQuantity("100", 64)
 	require.NoError(t, err)

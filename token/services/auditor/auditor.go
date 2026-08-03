@@ -415,14 +415,14 @@ func (r *requestWrapper) AuditRecord(ctx context.Context) (*token.AuditRecord, e
 
 // completeInputsWithEmptyEID fills in missing enrollment ID information for inputs in the audit record
 // by querying the token vault. This is necessary when inputs don't have enrollment IDs explicitly set.
-// It uses the first output's enrollment ID as the target and retrieves token details from the vault.
+// Each input is attributed to the enrollment ID resolved from its own token's
+// owner; an input that cannot be attributed fails the audit record instead of
+// being booked under a guessed enrollment ID.
 func (r *requestWrapper) completeInputsWithEmptyEID(ctx context.Context, record *token.AuditRecord) error {
 	filter := record.Inputs.ByEnrollmentID("")
 	if filter.Count() == 0 {
 		return nil
 	}
-	// TODO: extract from the audit tokens
-	targetEID := record.Outputs.EnrollmentIDs()[0]
 
 	// fetch all the tokens
 	tokens, err := r.tms.Vault().NewQueryEngine().ListAuditTokens(ctx, filter.IDs()...)
@@ -430,9 +430,17 @@ func (r *requestWrapper) completeInputsWithEmptyEID(ctx context.Context, record 
 		return errors.WithMessagef(err, "failed listing tokens for [%s]", filter.IDs())
 	}
 	precision := r.tms.PublicParametersManager().PublicParameters().Precision()
+	wm := r.tms.WalletManager()
 	for i := range filter.Count() {
 		item := filter.At(i)
-		item.EnrollmentID = targetEID
+		eID, err := wm.GetEnrollmentID(ctx, tokens[i].Owner)
+		if err != nil {
+			return errors.WithMessagef(err, "failed resolving enrollment id for input [%v]", item.Id)
+		}
+		if eID == "" {
+			return errors.Errorf("cannot attribute input [%v] to an enrollment ID", item.Id)
+		}
+		item.EnrollmentID = eID
 		item.Owner = tokens[i].Owner
 		item.Type = tokens[i].Type
 		q, err := token2.ToQuantity(tokens[i].Quantity, precision)
