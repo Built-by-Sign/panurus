@@ -150,11 +150,14 @@ func (d *Driver) NewTokenService(tmsID driver.TMSID, publicParams []byte) (drive
 	deserializer := ws.Deserializer
 	ip := ws.IdentityProvider
 
+	// Type-gated authorizations go first: the wallet-based one resolves any
+	// identity bound to a wallet, so it would claim escrow-typed tokens under
+	// the wrong wallet id and drop their ownership entries.
 	authorization := common.NewAuthorizationMultiplexer(
-		common.NewTMSAuthorization(logger, publicParamsManager.PublicParams(), ws),
 		htlc.NewScriptAuth(ws),
 		multisig.NewEscrowAuth(ws),
 		boolpolicy.NewEscrowAuth(ws),
+		common.NewTMSAuthorization(logger, publicParamsManager.PublicParams(), ws),
 	)
 	tokensService, err := v1.NewTokensService(publicParamsManager.PublicParams(), deserializer)
 	if err != nil {
