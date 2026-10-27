@@ -7,8 +7,11 @@ SPDX-License-Identifier: Apache-2.0
 package sdk
 
 import (
+	"github.com/LFDT-Panurus/panurus/token/core/common/metrics"
 	"github.com/LFDT-Panurus/panurus/token/sdk/db"
 	"github.com/LFDT-Panurus/panurus/token/services/storage/db/common"
+	"github.com/LFDT-Panurus/panurus/token/services/storage/db/guard"
+	"github.com/LFDT-Panurus/panurus/token/services/storage/services/checks"
 	"go.uber.org/dig"
 )
 
@@ -18,9 +21,15 @@ func NewAuditorCheckServiceProvider(in struct {
 	dig.In
 	TMSProvider     common.TokenManagementServiceProvider
 	NetworkProvider common.NetworkProvider
+	Configuration   checks.Configuration
+	MetricsProvider metrics.Provider
 	Checkers        []common.NamedChecker `group:"auditdb-checkers"`
+	Policy          guard.Policy
 }) *db.AuditorCheckServiceProvider {
-	return db.NewAuditorCheckServiceProvider(in.TMSProvider, in.NetworkProvider, in.Checkers)
+	provider := db.NewAuditorCheckServiceProvider(in.TMSProvider, in.NetworkProvider, in.Checkers, in.Configuration, in.MetricsProvider)
+	provider.MaxPageSize = in.Policy.MaxPageSize
+
+	return provider
 }
 
 // NewOwnerCheckServiceProvider creates an owner check service provider using dependency injection.
@@ -29,7 +38,13 @@ func NewOwnerCheckServiceProvider(in struct {
 	dig.In
 	TMSProvider     common.TokenManagementServiceProvider
 	NetworkProvider common.NetworkProvider
+	Configuration   checks.Configuration
+	MetricsProvider metrics.Provider
 	Checkers        []common.NamedChecker `group:"ttxdb-checkers"`
+	Policy          guard.Policy
 }) *db.OwnerCheckServiceProvider {
-	return db.NewOwnerCheckServiceProvider(in.TMSProvider, in.NetworkProvider, in.Checkers)
+	provider := db.NewOwnerCheckServiceProvider(in.TMSProvider, in.NetworkProvider, in.Checkers, in.Configuration, in.MetricsProvider)
+	provider.MaxPageSize = in.Policy.MaxPageSize
+
+	return provider
 }

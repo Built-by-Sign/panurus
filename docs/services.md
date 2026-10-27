@@ -75,7 +75,7 @@ The [Identity Service](./services/identity.md) is internal to Panurus and is **i
 The [Config Service](./services/config.md) manages configuration settings for Panurus. It provides a centralized way to access and manage configuration values for various components of Panurus, including token management services, drivers, and internal services.
 
 ### Network Service
-The [Network Service](./services/network.md) acts as a bridge layer. It translates generic token requests into backend-specific formats (such as Fabric or FabricX) and manages communication with the underlying ledger. It is also responsible for tracking transaction finality and triggering listeners when transactions are committed.
+The [Network Service](./services/network.md) acts as a bridge layer. It translates generic token requests into backend-specific formats (such as Fabric or FabricX) and manages communication with the underlying ledger. It is also responsible for tracking transaction finality and triggering listeners when transactions are committed. See [Token Transaction Finality](./services/finality.md) for a deep-dive into how finality is detected and what it changes in local storage.
 
 ### Storage Service
 The [Storage Service](./services/storage.md) encapsulates all data persistence mechanisms required by Panurus. It manages specialized databases for different types of information, including:
@@ -98,3 +98,6 @@ The [Certifier Service](./services/certifier.md) handles the lifecycle of token 
 
 ### Benchmark Service
 The [Benchmark Service](./services/benchmark.md) provides performance benchmarking capabilities for the Panurus. It allows developers and operators to measure the performance of various token operations under different configurations and workloads.
+
+### Observability Service
+The [Observability Service](./services/observability.md) provides injectable decorators, Prometheus metrics collection, and circuit breaker back-pressure protection for Token-API entry points and wallets.

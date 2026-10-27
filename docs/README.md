@@ -15,8 +15,13 @@ Welcome to Panurus documentation.
 
 ## Security
 
+*   [**OpenSSF Security Baseline**](openssf/README.md): Which OpenSSF Baseline level Panurus targets, what is already satisfied, and what is still pending.
+*   [**GO-2026-5932: the `openpgp` unmaintained-package advisory**](security/openpgp_unmaintained_advisory.md): Why the advisory against `golang.org/x/crypto/openpgp` is not a Panurus vulnerability — Panurus imports no openpgp code, so the risk is on whoever chooses to use OpenPGP.
 *   [**HTLC Deadlines and Clock Synchronisation**](security/htlc_deadline_clock_assumptions.md): The clock-synchronisation assumption that the HTLC claim/reclaim deadline rests on, and the deadline margin it requires of a deployment.
 *   [**Selector Resource Limits**](security/selector_resource_limits.md): How to throttle token selection, either with the opt-in built-in per-wallet rate limiter or by supplying your own limiter or `Locker`.
+*   [**Security Policy**](../SECURITY.md): How to report a vulnerability.
+*   [**Store Integrity Verification**](security/store_integrity_verification.md): What each store verifies about the payloads it persists, what it requires of its caller, and what it deliberately does not check.
+*   [**ZK-ATDLOG Range-Proof Fiat-Shamir Transcripts**](security/dlognogh_range_proof_transcripts.md): The Bulletproof and CSP range-proof transcript constructions, and why every challenge must depend on the full transcript absorbed so far.
 
 ## Command-Line Tools
 
@@ -27,6 +32,7 @@ Panurus ships several standalone CLI tools, each living in its own Go module und
 | [**tokengen**](../cmd/tokengen/README.md) | Generates public parameters, token chaincode packages, and other cryptographic artifacts. Used to pre-configure development and test environments. |
 | [**artifactgen**](../cmd/artifactgen/README.md) | Topology-driven artifact generation (previously part of `tokengen`). Kept separate to avoid pulling in the `integration/nwo` test framework. |
 | [**skicleanup**](../cmd/skicleanup/README.md) | Diagnostic tool that lists orphaned signer entries and their derived SKIs. Connects directly to an existing Panurus database (SQLite or PostgreSQL). |
+| [**tokendiag**](../cmd/tokendiag/README.md) | Diagnostic tool for inspecting token-selector state, starting with currently held token locks and settlement-status leaks. Connects directly to an existing Panurus database (SQLite or PostgreSQL). |
 
 ## Development
 
@@ -34,6 +40,7 @@ If you are developing *using* Panurus or contributing *to* Panurus, check out th
 
 *   [General Guidelines](development/general.md)
 *   [Idiomatic Go](development/idiomatic.md)
+*   [Dependency License Dispositions](development/license-dispositions.md)
 *   [Testing](development/testing.md)
 *   [Monitoring](development/monitoring.md), the [Metrics Reference](development/metrics.md) and the
     [Grafana dashboards](monitoring/grafana/README.md)

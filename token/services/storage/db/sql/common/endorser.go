@@ -18,6 +18,7 @@ import (
 	q "github.com/LFDT-Panurus/panurus/token/services/storage/db/sql/query"
 	common3 "github.com/LFDT-Panurus/panurus/token/services/storage/db/sql/query/common"
 	"github.com/LFDT-Panurus/panurus/token/services/storage/db/sql/query/cond"
+	"github.com/LFDT-Panurus/panurus/token/services/storage/integrity"
 	"github.com/hyperledger-labs/fabric-smart-client/pkg/utils/errors"
 	"github.com/hyperledger-labs/fabric-smart-client/platform/common/utils/collections/iterators"
 	"github.com/hyperledger-labs/fabric-smart-client/platform/view/services/storage/driver/sql/common"
@@ -26,7 +27,7 @@ import (
 // EndorserStore manages validation records for token transaction endorsements
 type EndorserStore struct {
 	readDB      *sql.DB
-	writeDB     *sql.DB
+	writeDB     WriteDB
 	table       string
 	tablePrefix string
 	tableParams []string
@@ -36,7 +37,8 @@ type EndorserStore struct {
 
 // NewEndorserStore creates a new EndorserStore
 func NewEndorserStore(
-	readDB, writeDB *sql.DB,
+	readDB *sql.DB,
+	writeDB WriteDB,
 	tables TableNames,
 	ci common3.CondInterpreter,
 	pi common3.PagInterpreter,
@@ -169,14 +171,29 @@ func (w *EndorserStoreTransaction) Commit() error {
 	return w.tx.Commit()
 }
 
-// Rollback rolls back the transaction
+// Rollback rolls back the transaction. A rollback failure cannot be returned
+// (the interface returns nothing) but is logged rather than dropped, so a
+// transaction that outlived its rollback leaves a trace. sql.ErrTxDone is
+// expected when the transaction has already been committed or rolled back.
 func (w *EndorserStoreTransaction) Rollback() {
-	_ = w.tx.Rollback()
+	if err := w.tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+		logger.Errorf("error rolling back endorser transaction (ignoring...): %s", err)
+	}
 }
 
-// AddValidationRecord adds a validation record to the database
+// AddValidationRecord adds a validation record to the database.
+//
+// Verification: as for TransactionStoreTransaction.AddTokenRequest, this layer
+// does not interpret tokenRequest — the wire-format check lives in the
+// endorserdb service. What is refused here is a row no later check could act
+// on: an empty transaction id, empty request bytes, or an empty public
+// parameters hash.
 func (w *EndorserStoreTransaction) AddValidationRecord(ctx context.Context, txID string, tokenRequest []byte, meta map[string][]byte, ppHash driver2.PPHash) error {
 	logger.DebugfContext(ctx, "adding validation record [%s]", txID)
+
+	if err := integrity.CheckTokenRequestForStorage(txID, tokenRequest, ppHash); err != nil {
+		return errors.WithMessagef(err, "refusing to add validation record for txid [%s]", txID)
+	}
 
 	metaBytes, err := marshal(meta)
 	if err != nil {

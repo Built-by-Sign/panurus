@@ -16,7 +16,7 @@ import (
 
 func WalletTest(t *testing.T, cfgProvider cfgProvider) {
 	t.Helper()
-	for _, c := range walletCases {
+	for _, c := range WalletCases {
 		drv := cfgProvider(c.Name)
 		db, err := drv.NewWallet("", c.Name)
 		if err != nil {
@@ -50,7 +50,10 @@ func WalletTest(t *testing.T, cfgProvider cfgProvider) {
 	}
 }
 
-var walletCases = []struct {
+// WalletCases is the shared WalletStore suite. It is exported so that the backends that have
+// no cfgProvider - the KVS ones, which are not SQL drivers - can run it too; see
+// WalletTest for the SQL entry point.
+var WalletCases = []struct {
 	Name string
 	Fn   func(*testing.T, driver.WalletStore, driver.IdentityStore, driver.IdentityConfiguration)
 }{
@@ -109,7 +112,9 @@ func TWalletConfigurationLink(t *testing.T, db driver.WalletStore, identityDB dr
 	confID := conf.UniqueID()
 
 	require.NoError(t, db.StoreIdentity(ctx, []byte("carol"), "eID", "carol_wallet", 0, nil, confID))
-	require.True(t, db.IdentityExists(ctx, []byte("carol"), "carol_wallet", 0))
+	exists, err := db.IdentityExists(ctx, []byte("carol"), "carol_wallet", 0)
+	require.NoError(t, err)
+	require.True(t, exists)
 
 	// The configuration this wallet links to must exist, under the exact
 	// (id, type, url) the wallet's confID was derived from.

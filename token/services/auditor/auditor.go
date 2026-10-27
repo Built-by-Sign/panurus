@@ -14,6 +14,7 @@ import (
 
 	"github.com/LFDT-Panurus/panurus/token"
 	"github.com/LFDT-Panurus/panurus/token/core/common/metrics"
+	"github.com/LFDT-Panurus/panurus/token/driver/protos-go/v1/request"
 	"github.com/LFDT-Panurus/panurus/token/services/identity"
 	"github.com/LFDT-Panurus/panurus/token/services/logging"
 	"github.com/LFDT-Panurus/panurus/token/services/network"
@@ -171,21 +172,9 @@ func (a *Service) Audit(ctx context.Context, tx Transaction) (*token.InputStream
 		return nil, nil, errors.WithMessagef(err, "failed getting transaction audit record")
 	}
 
-	var eids []string
-	eids = append(eids, record.Inputs.EnrollmentIDs()...)
-	eids = append(eids, record.Outputs.EnrollmentIDs()...)
-
 	// Acquire locks with retry and exponential backoff to prevent livelock
 	logger.DebugfContext(ctx, "audit transaction [%s], acquire locks with retry", tx.ID())
-	if err := a.acquireLocksWithRetry(ctx, string(request.Anchor), eids); err != nil {
-		// Only a genuine conflict counts towards the conflict metric. Counting every
-		// failure meant a graceful-shutdown cancellation or a database outage — neither
-		// of which involves a second holder — inflated the one signal operators are
-		// told to alert on for contention.
-		if errors.Is(err, auditdb.ErrLockContention) {
-			a.metrics.AuditLockConflicts.Add(1)
-		}
-
+	if err := a.lockRecordEnrollmentIDs(ctx, request.Anchor, record); err != nil {
 		return nil, nil, err
 	}
 
@@ -194,6 +183,31 @@ func (a *Service) Audit(ctx context.Context, tx Transaction) (*token.InputStream
 	a.metrics.AuditDuration.Observe(time.Since(start).Seconds())
 
 	return record.Inputs, record.Outputs, nil
+}
+
+// lockRecordEnrollmentIDs acquires the locks covering every enrollment ID the
+// passed record is booked under, so that the record cannot be stored under an
+// enrollment ID this node does not hold. It is the one place both entry points
+// into the store go through: Audit, and the Append that attributes its own
+// record. See docs/services/auditor.md for the locking rules.
+func (a *Service) lockRecordEnrollmentIDs(ctx context.Context, anchor token.RequestAnchor, record *token.AuditRecord) error {
+	var eids []string
+	eids = append(eids, record.Inputs.EnrollmentIDs()...)
+	eids = append(eids, record.Outputs.EnrollmentIDs()...)
+
+	if err := a.acquireLocksWithRetry(ctx, string(anchor), eids); err != nil {
+		// Only a genuine conflict counts towards the conflict metric. Counting every
+		// failure meant a graceful-shutdown cancellation or a database outage — neither
+		// of which involves a second holder — inflated the one signal operators are
+		// told to alert on for contention.
+		if errors.Is(err, auditdb.ErrLockContention) {
+			a.metrics.AuditLockConflicts.Add(1)
+		}
+
+		return err
+	}
+
+	return nil
 }
 
 // acquireLocksWithRetry attempts to acquire locks with exponential backoff and randomized jitter
@@ -258,21 +272,46 @@ func isRetriableLockError(ctx context.Context, err error) bool {
 		!errors.Is(err, auditdb.ErrLockSetWidened)
 }
 
-// Append adds the passed transaction to the auditor database, reusing the
-// audit record computed by Audit, when available.
-// It also releases the locks acquired by Audit.
+// Append adds the passed transaction to the auditor database, reusing the audit
+// record computed by Audit when available, and releases the locks on the way out.
+//
+// With no cached record — Append called on its own, a retry after a failed
+// Append, or an Append following an explicit Release — it attributes the record
+// here and locks the enrollment IDs that attribution books it under before
+// writing, so the write is never an unlocked one. See docs/services/auditor.md
+// for the attribution lifecycle.
 func (a *Service) Append(ctx context.Context, tx Transaction) error {
 	start := time.Now()
 	defer func() { a.metrics.AppendDuration.Observe(time.Since(start).Seconds()) }()
 	defer a.Release(ctx, tx)
 
-	tms, err := a.bindProviderTMS(tx.Request())
+	request := tx.Request()
+	tms, err := a.bindProviderTMS(request)
 	if err != nil {
+		a.metrics.AppendErrors.Add(1)
+
 		return err
 	}
 	// append request to audit db
-	wrapper := newRequestWrapper(tx.Request(), tms)
-	wrapper.cached = a.cachedAuditRecord(tx.Request())
+	wrapper := newRequestWrapper(request, tms)
+	wrapper.cached = a.cachedAuditRecord(request)
+	if wrapper.cached == nil {
+		record, err := wrapper.AuditRecord(ctx)
+		if err != nil {
+			a.metrics.AppendErrors.Add(1)
+
+			return errors.WithMessagef(err, "failed getting audit record for request %s", tx.ID())
+		}
+		if err := a.lockRecordEnrollmentIDs(ctx, request.Anchor, record); err != nil {
+			a.metrics.AppendErrors.Add(1)
+
+			return err
+		}
+		// the store reads the record back through the wrapper: hand it the one
+		// the locks were just taken for, so what is stored is what is locked
+		// and the vault is not read a second time
+		wrapper.cached = record
+	}
 	if err := a.auditDB.Append(ctx, wrapper); err != nil {
 		a.metrics.AppendErrors.Add(1)
 
@@ -292,6 +331,11 @@ func (a *Service) Append(ctx context.Context, tx Transaction) error {
 		finality.NewTokenRequestHasher(a.tmsProvider, a.tmsID),
 		a.auditDB,
 		a.tokenDB,
+		// An auditor never acquires token-selection locks for the transactions it audits -
+		// those belong to the node that assembled and spent them - so this listener has
+		// nothing to release when one settles. See NoSelectorManagerProvider (#2395
+		// mechanism 4).
+		finality.NewNoSelectorManagerProvider(),
 		a.finalityTracer,
 		a.metricsProvider,
 	)
@@ -431,8 +475,9 @@ func (a *Service) Check(ctx context.Context) ([]string, error) {
 type requestWrapper struct {
 	r   *token.Request
 	tms dep.TokenManagementService
-	// cached, when set, is a snapshot of the audit record computed by Audit
-	// for this request; AuditRecord reuses it instead of recomputing it.
+	// cached, when set, is an already attributed audit record for this
+	// request — the snapshot Audit computed, or the one Append attributed and
+	// locked itself; AuditRecord returns it instead of recomputing it.
 	cached *token.AuditRecord
 }
 
@@ -460,12 +505,13 @@ func (r *requestWrapper) PublicParamsHash() token.PPHash { return r.r.PublicPara
 
 // AuditRecord retrieves the audit record for the wrapped token request and completes any
 // inputs with missing enrollment IDs by querying the token vault.
-// A record cached by Audit is returned as it stands: it was already attributed
-// there, and the locks were taken for the enrollment IDs it carries.
+// A cached record is returned as it stands: it was already attributed, and the
+// locks were taken for the enrollment IDs it carries. A caller that attributes
+// a record here must lock it itself before storing it (see Service.Append).
 func (r *requestWrapper) AuditRecord(ctx context.Context) (*token.AuditRecord, error) {
 	// re-running the gap filling on a cached record could attribute an input
-	// Audit deliberately left empty, booking it under an enrollment ID that
-	// was never locked
+	// the attribution deliberately left empty, booking it under an enrollment
+	// ID that was never locked
 	if r.cached != nil {
 		return r.cached, nil
 	}
@@ -490,14 +536,21 @@ func (r *requestWrapper) AuditRecord(ctx context.Context) (*token.AuditRecord, e
 // an error that does not name the cause. It mirrors the store's grouping:
 // unattributed inputs are skipped.
 func rejectMultiOwnerActions(record *token.AuditRecord) error {
-	firstEID := map[int]string{}
+	// An action is named by its type and index together: issue and transfer actions are
+	// numbered independently, so their inputs can share an index.
+	type action struct {
+		actionType  request.ActionType
+		actionIndex int
+	}
+	firstEID := map[action]string{}
 	for _, in := range record.Inputs.Inputs() {
 		if in.EnrollmentID == "" {
 			continue
 		}
-		eID, ok := firstEID[in.ActionIndex]
+		key := action{actionType: in.ActionType, actionIndex: in.ActionIndex}
+		eID, ok := firstEID[key]
 		if !ok {
-			firstEID[in.ActionIndex] = in.EnrollmentID
+			firstEID[key] = in.EnrollmentID
 
 			continue
 		}
@@ -516,12 +569,13 @@ func rejectMultiOwnerActions(record *token.AuditRecord) error {
 // of the owner where present, the one carried by the request otherwise (see
 // Request.AuditRecord). An owner the identity layer cannot decode counts as
 // resolving to nothing; any other resolution failure — a storage error, a
-// canceled context — fails the audit. An input the request describes no sender for is an
-// upgrade input, and falls back to the enrollment ID the request issues to;
-// an upgrade issued to a composite owner spanning enrollment IDs fails the
-// audit (see issuedToEIDAndRH). An owner that maps to no single enrollment ID
-// leaves its input unattributed rather than booked under a guessed enrollment
-// ID, so a record keeping such an input is not fully attributed on return.
+// canceled context — fails the audit. An input of an issue action is an
+// upgrade input, and falls back to the enrollment ID the outputs of that same
+// issue action are issued to; an upgrade issued to a composite owner spanning
+// enrollment IDs fails the audit (see issuedToEIDAndRH). An owner that maps to
+// no single enrollment ID leaves its input unattributed rather than booked
+// under a guessed enrollment ID, so a record keeping such an input is not
+// fully attributed on return.
 func (r *requestWrapper) completeInputsWithEmptyEID(ctx context.Context, record *token.AuditRecord) error {
 	filter := record.Inputs.ByEnrollmentID("")
 	if filter.Count() == 0 {
@@ -543,9 +597,20 @@ func (r *requestWrapper) completeInputsWithEmptyEID(ctx context.Context, record 
 		if tokens[i] == nil {
 			return errors.Errorf("failed to audit inputs: nil input at [%d]th input", i)
 		}
-		// an input the request describes no sender for: extractIssueInputs fills
-		// only the token id, so across the built-in drivers this is an upgrade
-		upgraded := len(item.Owner) == 0
+		// attribution reads the kind of action an input belongs to, so an input
+		// naming none cannot be attributed: it would skip the upgrade fallback
+		// below and credit an upgraded amount to its receiver without ever
+		// debiting it. Every input built through token.NewInput names its
+		// action, so an unnamed one is a programming error, not a request the
+		// audit can pass.
+		if item.ActionType == request.ActionType_ACTION_TYPE_UNSPECIFIED {
+			return errors.Errorf("failed to audit inputs: input [%v] names no action kind", item.Id)
+		}
+		// an input of an issue action: extractIssueInputs fills only the token
+		// id, so across the built-in drivers this is an upgrade. Reading the
+		// action kind off the input keeps a transfer input whose sender happens
+		// to carry no identity out of the upgrade fallback.
+		upgraded := item.ActionType == request.ActionType_ACTION_TYPE_ISSUE
 
 		item.Owner = tokens[i].Owner
 		item.Type = tokens[i].Type
@@ -591,11 +656,16 @@ func (r *requestWrapper) completeInputsWithEmptyEID(ctx context.Context, record 
 	return nil
 }
 
-// issuedToEIDAndRH returns the enrollment ID and revocation handle the given issue
-// action issues to, and empty values when it does not issue to exactly one party.
-// An issued output carries both an issuer and an owner; a redeem output carries an
-// issuer but no owner. Every issued output of the action must resolve to the same
+// issuedToEIDAndRH returns the enrollment ID and revocation handle the issue
+// action at actionIndex issues to, and empty values when it does not issue to
+// exactly one party. Every issued output of the action must resolve to the same
 // enrollment ID. The handle is kept only while it stays paired with that ID.
+//
+// The action is named by the pair (issue, actionIndex): issue and transfer
+// actions are numbered independently, so an ActionIndex match alone also picks
+// up the outputs of the transfer action sitting at the same index. A redeem
+// output is dropped on its empty owner — it is issuer-only, and nothing is
+// issued to it to attribute an input from.
 //
 // A composite owner issues one output row per member, all under one output index.
 // Members resolving to distinct enrollment IDs leave no single enrollment ID to
@@ -605,7 +675,7 @@ func (r *requestWrapper) completeInputsWithEmptyEID(ctx context.Context, record 
 // nothing is credited and the input may stay unattributed.
 func issuedToEIDAndRH(outputs *token.OutputStream, actionIndex int) (string, string, error) {
 	issued := outputs.Filter(func(o *token.Output) bool {
-		return o.ActionIndex == actionIndex && len(o.Issuer) != 0 && len(o.Owner) != 0
+		return o.ActionType == request.ActionType_ACTION_TYPE_ISSUE && o.ActionIndex == actionIndex && len(o.Owner) != 0
 	}).Outputs()
 	if len(issued) == 0 {
 		return "", "", nil

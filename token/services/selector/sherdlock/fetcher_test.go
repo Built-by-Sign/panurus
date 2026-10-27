@@ -9,6 +9,8 @@ package sherdlock
 import (
 	"context"
 	"errors"
+	"fmt"
+	"math/big"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -44,6 +46,12 @@ func (m *mockTokenDB) SpendableTokensIteratorBy(ctx context.Context, walletID st
 	return args.Get(0).(driver.SpendableTokensIterator), args.Error(1)
 }
 
+func (m *mockTokenDB) HasEnoughSpendableTokens(ctx context.Context, walletID string, typ token2.Type, target *big.Int) (bool, error) {
+	args := m.Called(ctx, walletID, typ, target)
+
+	return args.Bool(0), args.Error(1)
+}
+
 func TestNewCachedFetcher_WithDefaults(t *testing.T) {
 	mockDB := new(mockTokenDB)
 
@@ -71,6 +79,47 @@ func TestNewCachedFetcher_WithCustomValues(t *testing.T) {
 	assert.NotNil(t, fetcher.cache)
 }
 
+// fetcherCacheSize is a number of tokens (#2506): 20 wallets holding one token each fit in
+// a cache of size 20.
+func TestCachedFetcher_CacheSizeCountsTokens(t *testing.T) {
+	mockDB := new(mockTokenDB)
+	tokens := make([]*token2.UnspentTokenInWallet, 0, 20)
+	for i := range 20 {
+		tokens = append(tokens, &token2.UnspentTokenInWallet{WalletID: fmt.Sprintf("wallet%d", i), Type: "USD", Quantity: "0x1"})
+	}
+	mockDB.On("SpendableTokensIteratorBy", mock.Anything, "", token2.Type("")).Return(iterators.Slice(tokens), nil)
+
+	fetcher := NewCachedFetcher(mockDB, 20, time.Minute, 1000)
+	fetcher.update(t.Context())
+
+	for _, tok := range tokens {
+		_, ok := fetcher.cache.Get(tokenKey(tok.WalletID, "USD"))
+		assert.True(t, ok, "tokens of [%s] should be cached", tok.WalletID)
+	}
+}
+
+// An entry costs as many units as it holds tokens: with a cache of size 2, a wallet holding
+// 2 tokens fits and a wallet holding 3 does not.
+func TestCachedFetcher_CacheEntryCostIsTokenCount(t *testing.T) {
+	mockDB := new(mockTokenDB)
+	tokens := []*token2.UnspentTokenInWallet{
+		{WalletID: "wallet1", Type: "USD", Quantity: "0x1"},
+		{WalletID: "wallet1", Type: "USD", Quantity: "0x2"},
+		{WalletID: "wallet1", Type: "USD", Quantity: "0x3"},
+		{WalletID: "wallet2", Type: "USD", Quantity: "0x1"},
+		{WalletID: "wallet2", Type: "USD", Quantity: "0x2"},
+	}
+	mockDB.On("SpendableTokensIteratorBy", mock.Anything, "", token2.Type("")).Return(iterators.Slice(tokens), nil)
+
+	fetcher := NewCachedFetcher(mockDB, 2, time.Minute, 1000)
+	fetcher.update(t.Context())
+
+	_, ok := fetcher.cache.Get(tokenKey("wallet1", "USD"))
+	assert.False(t, ok, "3 tokens do not fit in a cache of size 2")
+	_, ok = fetcher.cache.Get(tokenKey("wallet2", "USD"))
+	assert.True(t, ok, "2 tokens fit in a cache of size 2")
+}
+
 func TestCachedFetcher_IsCacheStale(t *testing.T) {
 	mockDB := new(mockTokenDB)
 	fetcher := NewCachedFetcher(mockDB, 0, 100*time.Millisecond, 0)
@@ -79,11 +128,11 @@ func TestCachedFetcher_IsCacheStale(t *testing.T) {
 	assert.True(t, fetcher.isCacheStale())
 
 	// Update lastFetched to now
-	atomic.StoreInt64(&fetcher.lastFetched, time.Now().UnixNano())
+	fetcher.lastFetched.Store(time.Now().UnixNano())
 	assert.False(t, fetcher.isCacheStale())
 
 	// Manually set lastFetched to the past instead of sleeping
-	atomic.StoreInt64(&fetcher.lastFetched, time.Now().Add(-fetcher.freshnessInterval*2).UnixNano())
+	fetcher.lastFetched.Store(time.Now().Add(-fetcher.freshnessInterval * 2).UnixNano())
 	assert.True(t, fetcher.isCacheStale())
 }
 
@@ -97,12 +146,12 @@ func TestCachedFetcher_IsCacheOverused(t *testing.T) {
 
 	// Simulate queries
 	for range maxQueries - 1 {
-		atomic.AddUint32(&fetcher.queriesResponded, 1)
+		fetcher.queriesResponded.Add(1)
 	}
 	assert.False(t, fetcher.isCacheOverused())
 
 	// One more query should make it overused
-	atomic.AddUint32(&fetcher.queriesResponded, 1)
+	fetcher.queriesResponded.Add(1)
 	assert.True(t, fetcher.isCacheOverused())
 }
 
@@ -141,7 +190,7 @@ func TestCachedFetcher_Update(t *testing.T) {
 
 	// Verify cache was updated
 	assert.False(t, fetcher.isCacheStale())
-	assert.Equal(t, uint32(0), atomic.LoadUint32(&fetcher.queriesResponded))
+	assert.Equal(t, uint32(0), fetcher.queriesResponded.Load())
 
 	// Verify tokens are in cache
 	key1 := tokenKey("wallet1", "USD")
@@ -180,10 +229,12 @@ func TestCachedFetcher_UnspentTokensIteratorBy_CacheHit(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.NotNil(t, it)
-	assert.True(t, it.(interface{ HasNext() bool }).HasNext())
+	item, err := it.Next()
+	require.NoError(t, err)
+	assert.NotNil(t, item)
 
 	// Verify query counter incremented
-	assert.Equal(t, uint32(1), atomic.LoadUint32(&fetcher.queriesResponded))
+	assert.Equal(t, uint32(1), fetcher.queriesResponded.Load())
 
 	mockDB.AssertExpectations(t)
 }
@@ -212,7 +263,9 @@ func TestCachedFetcher_UnspentTokensIteratorBy_CacheMiss(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotNil(t, it)
 	// Should return empty iterator
-	assert.False(t, it.(interface{ HasNext() bool }).HasNext())
+	item, err := it.Next()
+	require.NoError(t, err)
+	assert.Nil(t, item)
 
 	mockDB.AssertExpectations(t)
 }
@@ -237,7 +290,7 @@ func TestCachedFetcher_UnspentTokensIteratorBy_StaleCache(t *testing.T) {
 	fetcher.update(ctx)
 
 	// Trigger hard refresh by setting lastFetched to the past
-	atomic.StoreInt64(&fetcher.lastFetched, time.Now().Add(-fetcher.freshnessInterval*2).UnixNano())
+	fetcher.lastFetched.Store(time.Now().Add(-fetcher.freshnessInterval * 2).UnixNano())
 	assert.True(t, fetcher.isCacheStale())
 
 	// Setup second call expectation
@@ -301,7 +354,7 @@ func TestCachedFetcher_CacheClear(t *testing.T) {
 	mockDB.On("SpendableTokensIteratorBy", mock.Anything, "", token2.Type("")).Return(mockIterator2, nil).Once()
 
 	// Force cache to be stale so update will actually run
-	atomic.StoreInt64(&fetcher.lastFetched, time.Now().Add(-20*time.Second).UnixNano())
+	fetcher.lastFetched.Store(time.Now().Add(-20 * time.Second).UnixNano())
 
 	fetcher.update(ctx)
 
@@ -798,7 +851,7 @@ func TestCachedFetcher_Update_ThunderingHerd(t *testing.T) {
 
 	// Trigger staleness manually
 	fetcher.mu.Lock()
-	atomic.StoreInt64(&fetcher.lastFetched, time.Now().Add(-10*time.Second).UnixNano())
+	fetcher.lastFetched.Store(time.Now().Add(-10 * time.Second).UnixNano())
 	fetcher.mu.Unlock()
 
 	// Block the next DB call with a mock that waits
@@ -840,7 +893,7 @@ func TestCachedFetcher_Update_ThunderingHerd(t *testing.T) {
 // TestNewFetcherProvider verifies provider creation with valid/invalid strategies and zero values.
 func TestNewFetcherProvider(t *testing.T) {
 	t.Run("creates provider with valid strategy", func(t *testing.T) {
-		provider := NewFetcherProvider(
+		provider, err := NewFetcherProvider(
 			nil,
 			&disabled.Provider{},
 			Mixed,
@@ -849,27 +902,35 @@ func TestNewFetcherProvider(t *testing.T) {
 			10,
 		)
 
+		require.NoError(t, err)
 		assert.NotNil(t, provider)
 		assert.Equal(t, int64(100), provider.cacheSize)
 		assert.Equal(t, time.Second, provider.freshnessInterval)
 		assert.Equal(t, 10, provider.maxQueries)
 	})
 
-	t.Run("panics with invalid strategy", func(t *testing.T) {
-		assert.Panics(t, func() {
-			NewFetcherProvider(
-				nil,
-				&disabled.Provider{},
-				"invalid",
-				100,
-				time.Second,
-				10,
-			)
-		})
+	t.Run("returns an error with invalid strategy", func(t *testing.T) {
+		provider, err := NewFetcherProvider(
+			nil,
+			&disabled.Provider{},
+			"invalid",
+			100,
+			time.Second,
+			10,
+		)
+
+		require.Error(t, err)
+		assert.Nil(t, provider)
+		assert.Contains(t, err.Error(), "undefined fetcher strategy [invalid]")
+		// The message must name the accepted values, since it is what an operator sees when
+		// token.selector.fetcherStrategy is misspelled.
+		for _, strategy := range SupportedFetcherStrategies() {
+			assert.Contains(t, err.Error(), string(strategy))
+		}
 	})
 
 	t.Run("creates provider with zero values", func(t *testing.T) {
-		provider := NewFetcherProvider(
+		provider, err := NewFetcherProvider(
 			nil,
 			&disabled.Provider{},
 			Mixed,
@@ -878,11 +939,78 @@ func TestNewFetcherProvider(t *testing.T) {
 			0,
 		)
 
+		require.NoError(t, err)
 		assert.NotNil(t, provider)
 		assert.Equal(t, int64(0), provider.cacheSize)
 		assert.Equal(t, time.Duration(0), provider.freshnessInterval)
 		assert.Equal(t, 0, provider.maxQueries)
 	})
+
+	t.Run("empty strategy selects the default", func(t *testing.T) {
+		defaulted, err := NewFetcherProvider(nil, &disabled.Provider{}, "", 0, 0, 0)
+		require.NoError(t, err)
+		require.NotNil(t, defaulted)
+
+		explicit, err := NewFetcherProvider(nil, &disabled.Provider{}, DefaultFetcherStrategy, 0, 0, 0)
+		require.NoError(t, err)
+
+		// fetchFunc values are not comparable, so compare the fetcher each one builds.
+		assert.IsType(t,
+			explicit.fetch(&tokendb.StoreService{}, nil, 0, 0, 0),
+			defaulted.fetch(&tokendb.StoreService{}, nil, 0, 0, 0),
+		)
+	})
+}
+
+// TestSupportedFetcherStrategies pins the set of selectable strategies: every declared
+// FetcherStrategy constant must be registered, and every registered one must be usable.
+// Issue #2022 was that four of five declared constants had no registry entry.
+func TestSupportedFetcherStrategies(t *testing.T) {
+	assert.Equal(t, []FetcherStrategy{Eager, Lazy, Mixed}, SupportedFetcherStrategies())
+
+	for _, strategy := range SupportedFetcherStrategies() {
+		t.Run(string(strategy), func(t *testing.T) {
+			provider, err := NewFetcherProvider(nil, &disabled.Provider{}, strategy, 0, 0, 0)
+			require.NoError(t, err)
+			require.NotNil(t, provider)
+			assert.NotNil(t, provider.fetch(&tokendb.StoreService{}, NewMetrics(&disabled.Provider{}), 0, 0, 0))
+		})
+	}
+}
+
+// TestFetcherStrategyBuildsExpectedFetcher verifies that each strategy selects the fetcher
+// implementation it names, rather than all of them resolving to the same one.
+func TestFetcherStrategyBuildsExpectedFetcher(t *testing.T) {
+	tests := []struct {
+		strategy FetcherStrategy
+		expected TokenFetcher
+	}{
+		{strategy: Lazy, expected: &lazyFetcher{}},
+		{strategy: Eager, expected: &cachedFetcher{}},
+		{strategy: Mixed, expected: &mixedFetcher{}},
+	}
+
+	for _, tt := range tests {
+		t.Run(string(tt.strategy), func(t *testing.T) {
+			provider, err := NewFetcherProvider(
+				&mockStoreServiceManager{
+					storeServiceByTMSIdFunc: func(tmsID token.TMSID) (*tokendb.StoreService, error) {
+						return &tokendb.StoreService{}, nil
+					},
+				},
+				&disabled.Provider{},
+				tt.strategy,
+				0,
+				0,
+				0,
+			)
+			require.NoError(t, err)
+
+			fetcher, err := provider.GetFetcher(token.TMSID{})
+			require.NoError(t, err)
+			assert.IsType(t, tt.expected, fetcher)
+		})
+	}
 }
 
 // TestFetcherProvider_GetFetcher verifies errors when token store unavailable.
@@ -894,7 +1022,7 @@ func TestFetcherProvider_GetFetcher(t *testing.T) {
 			},
 		}
 
-		provider := NewFetcherProvider(
+		provider, err := NewFetcherProvider(
 			mockStoreManager,
 			&disabled.Provider{},
 			Mixed,
@@ -902,6 +1030,7 @@ func TestFetcherProvider_GetFetcher(t *testing.T) {
 			time.Second,
 			10,
 		)
+		require.NoError(t, err)
 
 		fetcher, err := provider.GetFetcher(token.TMSID{})
 
@@ -917,7 +1046,7 @@ func TestFetcherProvider_GetFetcher(t *testing.T) {
 			},
 		}
 
-		provider := NewFetcherProvider(
+		provider, err := NewFetcherProvider(
 			mockStoreManager,
 			&disabled.Provider{},
 			Mixed,
@@ -925,6 +1054,7 @@ func TestFetcherProvider_GetFetcher(t *testing.T) {
 			time.Second,
 			10,
 		)
+		require.NoError(t, err)
 
 		fetcher, err := provider.GetFetcher(token.TMSID{})
 
@@ -1050,7 +1180,7 @@ func TestCachedFetcher_UpdateDoesNotBlockReaders(t *testing.T) {
 	fetcher.update(ctx)
 
 	// Make cache stale so update() will be called
-	atomic.StoreInt64(&fetcher.lastFetched, time.Now().Add(-20*time.Second).UnixNano())
+	fetcher.lastFetched.Store(time.Now().Add(-20 * time.Second).UnixNano())
 
 	// Use channels to synchronize instead of Sleep
 	dbStarted := make(chan struct{})
@@ -1109,7 +1239,7 @@ func TestCachedFetcher_UpdateReacquiresLockAfterDB(t *testing.T) {
 	fetcher := NewCachedFetcher(mockDB, 0, 1*time.Second, 100)
 
 	// Pre-populate to make cache appear stale
-	atomic.StoreInt64(&fetcher.lastFetched, time.Now().Add(-20*time.Second).UnixNano())
+	fetcher.lastFetched.Store(time.Now().Add(-20 * time.Second).UnixNano())
 
 	tokens := []*token2.UnspentTokenInWallet{
 		{WalletID: "wallet1", Type: "USD", Quantity: "300"},
@@ -1122,7 +1252,7 @@ func TestCachedFetcher_UpdateReacquiresLockAfterDB(t *testing.T) {
 
 	// After update completes, cache should be refreshed (not stale)
 	assert.False(t, fetcher.isCacheStale())
-	assert.Equal(t, uint32(0), atomic.LoadUint32(&fetcher.queriesResponded))
+	assert.Equal(t, uint32(0), fetcher.queriesResponded.Load())
 
 	// Token should be in cache
 	fetcher.mu.RLock()

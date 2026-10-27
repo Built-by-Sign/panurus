@@ -23,6 +23,7 @@ These targets run various test suites.
 | `make unit-tests` | Runs standard unit tests for Panurus, excluding integration and regression tests. |
 | `make unit-tests-race` | Runs unit tests with the Go race detector enabled. |
 | `make unit-tests-regression` | Runs regression tests. |
+| `make test-evm-contracts` | Runs the EVM driver's Solidity tests (`forge test`) and `forge fmt --check`. Skips without `forge` or the `forge-std` submodule; set `EVM_CONTRACTS_REQUIRED=1` to fail instead. |
 
 ### Integration Tests
 
@@ -60,6 +61,7 @@ These targets help keep your project clean and tidy.
 | `make clean-fabric-peer-images` | Removes Docker images related to Fabric peers. |
 | `make lint` | Runs `golangci-lint` to check code quality. |
 | `make lint-auto-fix` | Runs `golangci-lint` and automatically fixes issues where possible. |
+| `make govulncheck` | Scans dependencies for known, reachable vulnerabilities with `govulncheck`. Findings listed in `ci/govulncheck-allowlist.txt` don't fail the build. |
 
 ## Tools Generation
 

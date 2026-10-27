@@ -1,0 +1,172 @@
+.PHONY: test-evm-contracts
+# run the Solidity test suite for the EVM network driver's contracts (forge test) and check their
+# formatting (forge fmt --check). This is the ~950 lines under x/token/services/network/evm/contracts/
+# test/, including the cross-implementation golden-digest gate in EIP712.t.sol - see that directory's
+# README.md.
+#
+# Needs Foundry (forge) on PATH and the forge-std submodule checked out (git submodule update --init
+# --recursive). install-tools does neither, so without them the target prints a pointer and skips,
+# matching how the Go e2e suite (x/token/services/network/evm/e2e_anvil_test.go) self-skips without
+# anvil/forge. Set EVM_CONTRACTS_REQUIRED=1 to fail instead of skipping; CI does, so a broken setup
+# there cannot pass as a skip. It is a separate step in CI, not part of unit-tests, so a contract or
+# formatting failure does not hide the Go results.
+EVM_CONTRACTS_DIR = x/token/services/network/evm/contracts
+test-evm-contracts:
+	@missing=""; \
+	if ! command -v forge >/dev/null 2>&1; then \
+		missing="forge is not installed"; \
+	elif [ ! -f $(EVM_CONTRACTS_DIR)/lib/forge-std/src/Test.sol ]; then \
+		missing="the forge-std submodule is not checked out (git submodule update --init --recursive)"; \
+	fi; \
+	if [ -n "$$missing" ]; then \
+		if [ "$(EVM_CONTRACTS_REQUIRED)" = 1 ]; then \
+			echo "$$missing; cannot run the Solidity contract tests (see $(EVM_CONTRACTS_DIR)/README.md)"; \
+			exit 1; \
+		fi; \
+		echo "$$missing; skipping the Solidity contract tests (see $(EVM_CONTRACTS_DIR)/README.md)"; \
+	else \
+		cd $(EVM_CONTRACTS_DIR) && forge test && forge fmt --check; \
+	fi
+
+.PHONY: besu-docker-images
+# pull the besu docker image the EVM integration suites run against
+besu-docker-images:
+	docker pull $(BESU_IMAGE)
+
+.PHONY: fabricx-evm-docker-images
+# pull the fabric-x-evm docker image the EVM gateway integration suite runs against
+fabricx-evm-docker-images:
+	docker pull $(FABRICX_EVM_IMAGE)
+
+.PHONY: integration-tests-evm
+# run the fungible integration tests against an EVM backend (Besu).
+# Unlike the fabric suites this needs no FAB_BINS, but it does need docker and forge.
+integration-tests-evm: besu-docker-images
+	cd ./integration/token/fungible/evm; ginkgo $(GINKGO_TEST_OPTS) --label-filter="$(TEST_FILTER)" .
+
+.PHONY: integration-tests-evm-t1
+integration-tests-evm-t1:
+	make integration-tests-evm TEST_FILTER="T1"
+
+.PHONY: integration-tests-evm-t2
+integration-tests-evm-t2:
+	make integration-tests-evm TEST_FILTER="T2"
+
+.PHONY: integration-tests-evm-t2.1
+integration-tests-evm-t2.1:
+	make integration-tests-evm TEST_FILTER="T2.1"
+
+.PHONY: integration-tests-evm-t6
+integration-tests-evm-t6:
+	make integration-tests-evm TEST_FILTER="T6"
+
+.PHONY: integration-tests-evm-t9
+integration-tests-evm-t9:
+	make integration-tests-evm TEST_FILTER="T9"
+
+.PHONY: integration-tests-evm-t11
+integration-tests-evm-t11:
+	make integration-tests-evm TEST_FILTER="T11"
+
+.PHONY: integration-tests-evm-t12
+integration-tests-evm-t12:
+	make integration-tests-evm TEST_FILTER="T12"
+
+.PHONY: integration-tests-evm-t13
+integration-tests-evm-t13:
+	make integration-tests-evm TEST_FILTER="T13"
+
+.PHONY: integration-tests-evm-fabtoken
+# run the fungible integration tests against an EVM backend with the fabtoken driver.
+integration-tests-evm-fabtoken: besu-docker-images
+	cd ./integration/token/fungible/evmfabtoken; ginkgo $(GINKGO_TEST_OPTS) --label-filter="$(TEST_FILTER)" .
+
+.PHONY: integration-tests-evm-fabtoken-t1
+integration-tests-evm-fabtoken-t1:
+	make integration-tests-evm-fabtoken TEST_FILTER="T1"
+
+.PHONY: integration-tests-evm-fabtoken-t2
+integration-tests-evm-fabtoken-t2:
+	make integration-tests-evm-fabtoken TEST_FILTER="T2"
+
+.PHONY: integration-tests-evm-fabtoken-t6
+integration-tests-evm-fabtoken-t6:
+	make integration-tests-evm-fabtoken TEST_FILTER="T6"
+
+.PHONY: integration-tests-evm-fabtoken-t9
+integration-tests-evm-fabtoken-t9:
+	make integration-tests-evm-fabtoken TEST_FILTER="T9"
+
+.PHONY: integration-tests-evm-fabtoken-t11
+integration-tests-evm-fabtoken-t11:
+	make integration-tests-evm-fabtoken TEST_FILTER="T11"
+
+.PHONY: integration-tests-evm-fabtoken-t13
+integration-tests-evm-fabtoken-t13:
+	make integration-tests-evm-fabtoken TEST_FILTER="T13"
+
+.PHONY: integration-tests-evm-gateway
+# run the fungible integration tests against the fabric-x-evm gateway backend.
+integration-tests-evm-gateway: fabricx-evm-docker-images
+	cd ./integration/token/fungible/evmgw; ginkgo $(GINKGO_TEST_OPTS) --label-filter="$(TEST_FILTER)" .
+
+.PHONY: integration-tests-evm-gateway-t1
+integration-tests-evm-gateway-t1:
+	make integration-tests-evm-gateway TEST_FILTER="T1"
+
+.PHONY: integration-tests-evm-gateway-t2
+integration-tests-evm-gateway-t2:
+	make integration-tests-evm-gateway TEST_FILTER="T2"
+
+.PHONY: integration-tests-evm-gateway-t2.1
+integration-tests-evm-gateway-t2.1:
+	make integration-tests-evm-gateway TEST_FILTER="T2.1"
+
+.PHONY: integration-tests-evm-gateway-t6
+integration-tests-evm-gateway-t6:
+	make integration-tests-evm-gateway TEST_FILTER="T6"
+
+.PHONY: integration-tests-evm-gateway-t9
+integration-tests-evm-gateway-t9:
+	make integration-tests-evm-gateway TEST_FILTER="T9"
+
+.PHONY: integration-tests-evm-gateway-t11
+integration-tests-evm-gateway-t11:
+	make integration-tests-evm-gateway TEST_FILTER="T11"
+
+.PHONY: integration-tests-evm-gateway-t12
+integration-tests-evm-gateway-t12:
+	make integration-tests-evm-gateway TEST_FILTER="T12"
+
+.PHONY: integration-tests-evm-gateway-t13
+integration-tests-evm-gateway-t13:
+	make integration-tests-evm-gateway TEST_FILTER="T13"
+
+.PHONY: integration-tests-evm-gateway-fabtoken
+# run the fungible integration tests against the fabric-x-evm gateway backend with the fabtoken driver.
+integration-tests-evm-gateway-fabtoken: fabricx-evm-docker-images
+	cd ./integration/token/fungible/evmgwfabtoken; ginkgo $(GINKGO_TEST_OPTS) --label-filter="$(TEST_FILTER)" .
+
+.PHONY: integration-tests-evm-gateway-fabtoken-t1
+integration-tests-evm-gateway-fabtoken-t1:
+	make integration-tests-evm-gateway-fabtoken TEST_FILTER="T1"
+
+.PHONY: integration-tests-evm-gateway-fabtoken-t2
+integration-tests-evm-gateway-fabtoken-t2:
+	make integration-tests-evm-gateway-fabtoken TEST_FILTER="T2"
+
+.PHONY: integration-tests-evm-gateway-fabtoken-t6
+integration-tests-evm-gateway-fabtoken-t6:
+	make integration-tests-evm-gateway-fabtoken TEST_FILTER="T6"
+
+.PHONY: integration-tests-evm-gateway-fabtoken-t9
+integration-tests-evm-gateway-fabtoken-t9:
+	make integration-tests-evm-gateway-fabtoken TEST_FILTER="T9"
+
+.PHONY: integration-tests-evm-gateway-fabtoken-t11
+integration-tests-evm-gateway-fabtoken-t11:
+	make integration-tests-evm-gateway-fabtoken TEST_FILTER="T11"
+
+.PHONY: integration-tests-evm-gateway-fabtoken-t13
+integration-tests-evm-gateway-fabtoken-t13:
+	make integration-tests-evm-gateway-fabtoken TEST_FILTER="T13"

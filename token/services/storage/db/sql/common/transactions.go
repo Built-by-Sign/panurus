@@ -12,7 +12,7 @@ import (
 	"encoding/json"
 	errors2 "errors"
 	"fmt"
-	"strings"
+	"math/big"
 	"time"
 
 	"github.com/LFDT-Panurus/panurus/token"
@@ -24,11 +24,11 @@ import (
 	common3 "github.com/LFDT-Panurus/panurus/token/services/storage/db/sql/query/common"
 	"github.com/LFDT-Panurus/panurus/token/services/storage/db/sql/query/cond"
 	_select "github.com/LFDT-Panurus/panurus/token/services/storage/db/sql/query/select"
-	"github.com/hashicorp/go-uuid"
+	"github.com/LFDT-Panurus/panurus/token/services/storage/integrity"
+	"github.com/google/uuid"
 	"github.com/hyperledger-labs/fabric-smart-client/pkg/utils/errors"
 	driver3 "github.com/hyperledger-labs/fabric-smart-client/platform/common/driver"
 	"github.com/hyperledger-labs/fabric-smart-client/platform/common/utils/collections/iterators"
-	common2 "github.com/hyperledger-labs/fabric-smart-client/platform/view/services/storage/driver/common"
 	"github.com/hyperledger-labs/fabric-smart-client/platform/view/services/storage/driver/sql/common"
 )
 
@@ -37,23 +37,57 @@ import (
 // 255 is used as a conservative safe upper bound.
 const maxAmountBits = 255
 
+// validateAmount reports whether amount can be stored in an amount column without loss.
+// Callers must run it before inserting, so that a value the column cannot hold surfaces as
+// an error instead of a row whose amount disagrees with its quantity.
+//
+// The check is on magnitude only: movement and transaction amounts are signed by design, a
+// negative one meaning tokens left the wallet (see dbdriver.MovementRecord.Amount). Callers
+// storing an amount that mirrors an unsigned token quantity must use validateTokenAmount.
+func validateAmount(amount *big.Int) error {
+	if amount == nil {
+		return dbdriver.ErrAmountMissing
+	}
+	if amount.BitLen() > maxAmountBits {
+		return errors.WithMessagef(dbdriver.ErrAmountOutOfRange, "amount [%s] does not fit in %d bits", amount, maxAmountBits)
+	}
+
+	return nil
+}
+
+// validateTokenAmount is validateAmount for an amount that mirrors a token's quantity, which
+// is unsigned. big.Int.BitLen is defined on the absolute value, so validateAmount alone would
+// accept a negative amount of small magnitude; rejecting the sign here keeps the invariant
+// enforced at the write instead of relying on every caller going through token.ToQuantity.
+func validateTokenAmount(amount *big.Int) error {
+	if err := validateAmount(amount); err != nil {
+		return err
+	}
+	if amount.Sign() < 0 {
+		return errors.WithMessagef(dbdriver.ErrAmountNegative, "amount [%s] is negative", amount)
+	}
+
+	return nil
+}
+
 type transactionTables struct {
 	Movements             string
 	Transactions          string
 	Requests              string
 	TransactionEndorseAck string
+	Findings              string
 }
 
 type TransactionStore struct {
 	readDB                *sql.DB
-	writeDB               *sql.DB
+	writeDB               WriteDB
 	table                 transactionTables
 	tablePrefix           string
 	tableParams           []string
 	ci                    common3.CondInterpreter
 	pi                    common3.PagInterpreter
 	notifier              dbdriver.TransactionNotifier
-	recoveryLeaderFactory func(context.Context, *sql.DB, int64) (dbdriver.RecoveryLeadership, bool, error)
+	recoveryLeaderFactory func(context.Context, WriteDB) (dbdriver.RecoveryLeadership, bool, error)
 
 	// getStatusStmt caches the single prepared statement for GetStatus.
 	// Unlike the token-store queries, this query has exactly one shape
@@ -67,14 +101,15 @@ type TransactionStore struct {
 }
 
 func newTransactionStore(
-	readDB, writeDB *sql.DB,
+	readDB *sql.DB,
+	writeDB WriteDB,
 	tablePrefix string,
 	tableParams []string,
 	tables transactionTables,
 	ci common3.CondInterpreter,
 	pi common3.PagInterpreter,
 	notifier dbdriver.TransactionNotifier,
-	recoveryLeaderFactory func(context.Context, *sql.DB, int64) (dbdriver.RecoveryLeadership, bool, error),
+	recoveryLeaderFactory func(context.Context, WriteDB) (dbdriver.RecoveryLeadership, bool, error),
 ) *TransactionStore {
 	ts := &TransactionStore{
 		readDB:                readDB,
@@ -112,32 +147,35 @@ func (s *TransactionStore) PrefixedTableName(name string) string {
 	return formatted
 }
 
-func NewAuditTransactionStore(readDB, writeDB *sql.DB, tables TableNames, ci common3.CondInterpreter, pi common3.PagInterpreter) (*TransactionStore, error) {
+func NewAuditTransactionStore(readDB *sql.DB, writeDB WriteDB, tables TableNames, ci common3.CondInterpreter, pi common3.PagInterpreter) (*TransactionStore, error) {
 	return NewOwnerTransactionStore(readDB, writeDB, tables, ci, pi)
 }
 
-func NewOwnerTransactionStore(readDB, writeDB *sql.DB, tables TableNames, ci common3.CondInterpreter, pi common3.PagInterpreter) (*TransactionStore, error) {
+func NewOwnerTransactionStore(readDB *sql.DB, writeDB WriteDB, tables TableNames, ci common3.CondInterpreter, pi common3.PagInterpreter) (*TransactionStore, error) {
 	return newTransactionStore(readDB, writeDB, tables.Prefix, tables.Params, transactionTables{
 		Movements:             tables.Movements,
 		Transactions:          tables.Transactions,
 		Requests:              tables.Requests,
 		TransactionEndorseAck: tables.TransactionEndorseAck,
+		Findings:              tables.Findings,
 	}, ci, pi, nil, nil), nil
 }
 
 func NewTransactionStoreWithNotifierAndRecovery(
-	readDB, writeDB *sql.DB,
+	readDB *sql.DB,
+	writeDB WriteDB,
 	tables TableNames,
 	ci common3.CondInterpreter,
 	pi common3.PagInterpreter,
 	notifier dbdriver.TransactionNotifier,
-	recoveryLeaderFactory func(context.Context, *sql.DB, int64) (dbdriver.RecoveryLeadership, bool, error),
+	recoveryLeaderFactory func(context.Context, WriteDB) (dbdriver.RecoveryLeadership, bool, error),
 ) (*TransactionStore, error) {
 	return newTransactionStore(readDB, writeDB, tables.Prefix, tables.Params, transactionTables{
 		Movements:             tables.Movements,
 		Transactions:          tables.Transactions,
 		Requests:              tables.Requests,
 		TransactionEndorseAck: tables.TransactionEndorseAck,
+		Findings:              tables.Findings,
 	}, ci, pi, notifier, recoveryLeaderFactory), nil
 }
 
@@ -255,7 +293,15 @@ func (db *TransactionStore) QueryTransactions(ctx context.Context, params dbdriv
 			cond.Cmp(transactionsTable.Field("tx_id"), "=", requestsTable.Field("tx_id"))),
 		).
 		Where(HasTransactionParams(params, transactionsTable)).
-		OrderBy(orderBy(transactionsTable.Field("stored_at"), params.SearchDirection)).
+		// tx_id breaks ties deterministically, so every movement row of a given
+		// transaction is contiguous in the ordering (and thus never split across a
+		// page boundary) even when several share the same stored_at value.
+		// walkTransactions relies on this to dedupe transactions in O(1) memory
+		// instead of tracking every distinct tx_id seen across the whole walk.
+		OrderBy(
+			orderBy(transactionsTable.Field("stored_at"), params.SearchDirection),
+			orderBy(transactionsTable.Field("tx_id"), params.SearchDirection),
+		).
 		Paginated(pagination).
 		FormatPaginated(db.ci, db.pi)
 
@@ -361,7 +407,7 @@ func (db *TransactionStore) Notifier() (dbdriver.TransactionNotifier, error) {
 	return db.notifier, nil
 }
 
-// QueryTokenRequests returns an iterator over the token requests matching the passed params
+// QueryTokenRequests returns an iterator over the token requests matching the passed params.
 func (db *TransactionStore) QueryTokenRequests(ctx context.Context, params dbdriver.QueryTokenRequestsParams) (dbdriver.TokenRequestIterator, error) {
 	query, args := q.Select().
 		FieldsByName("tx_id", "request", "status").
@@ -381,12 +427,22 @@ func (db *TransactionStore) QueryTokenRequests(ctx context.Context, params dbdri
 
 // AcquireRecoveryLeadership returns a leadership handle for recovery sweeping.
 // When no leader factory is configured, leadership is granted locally.
-func (db *TransactionStore) AcquireRecoveryLeadership(ctx context.Context, lockID int64) (dbdriver.RecoveryLeadership, bool, error) {
+func (db *TransactionStore) AcquireRecoveryLeadership(ctx context.Context) (dbdriver.RecoveryLeadership, bool, error) {
 	if db.recoveryLeaderFactory == nil {
 		return noopRecoveryLeadership{}, true, nil
 	}
 
-	return db.recoveryLeaderFactory(ctx, db.writeDB, lockID)
+	return db.recoveryLeaderFactory(ctx, db.writeDB)
+}
+
+// AcquireLeadership returns a leadership handle for an arbitrary caller-chosen
+// lockID, independent of the recovery lock bound at construction. It exists for
+// callers that need their own leader election - such as the ledger drift checks
+// sweep - so they never contend with the recovery sweep for the same lock.
+// The default implementation grants leadership locally: backends that support
+// real distributed locking (e.g. postgres) override it.
+func (db *TransactionStore) AcquireLeadership(context.Context, int64) (dbdriver.RecoveryLeadership, bool, error) {
+	return noopRecoveryLeadership{}, true, nil
 }
 
 // ClaimPendingTransactions returns a claimed batch of Pending transactions.
@@ -426,14 +482,31 @@ func (db *TransactionStore) ReleaseRecoveryClaim(context.Context, string, string
 	return nil
 }
 
+// AddTransactionEndorsementAck records the signature of endorser over the
+// payload it was sent for txID.
+//
+// Verification: the signature cannot be verified here — the payload it was
+// produced over is not persisted, so the caller is the last holder of it. This
+// layer refuses a vacuous acknowledgement: one with no endorser identity, which
+// would collide with every other such row when read back into a map keyed by
+// endorser, or no signature, which would be indistinguishable from a genuine
+// acknowledgement to every consumer.
 func (db *TransactionStore) AddTransactionEndorsementAck(ctx context.Context, txID string, endorser token.Identity, sigma []byte) (err error) {
 	logger.DebugfContext(ctx, "adding transaction endorse ack record [%s]", txID)
 
+	if txID == "" {
+		return errors.WithMessage(integrity.ErrEmptyTxID, "refusing to add endorsement ack")
+	}
+	if err := integrity.CheckEndorsementAck(endorser, sigma); err != nil {
+		return errors.WithMessagef(err, "refusing to add endorsement ack for txid [%s]", txID)
+	}
+
 	now := time.Now().UTC()
-	id, err := uuid.GenerateUUID()
+	u, err := uuid.NewRandom()
 	if err != nil {
 		return errors.Wrapf(err, "error generating uuid")
 	}
+	id := u.String()
 	query, args := q.InsertInto(db.table.TransactionEndorseAck).
 		Fields("id", "tx_id", "endorser", "sigma", "stored_at").
 		Row(id, txID, endorser, sigma, now).
@@ -488,7 +561,7 @@ func (db *TransactionStore) Close() error {
 	_ = db.getStatusStmt.Close()
 	_ = db.getTokenRequestStmt.Close()
 
-	return common2.Close(db.readDB, db.writeDB)
+	return CloseRWDB(db.readDB, db.writeDB)
 }
 
 func (db *TransactionStore) SetStatus(ctx context.Context, txID string, status dbdriver.TxStatus, message string) error {
@@ -579,7 +652,7 @@ func (db *TransactionStore) GetSchema() string {
 		db.table.Transactions, db.table.Requests, db.table.Transactions, db.table.Transactions, db.table.Transactions, db.table.Transactions, db.table.Transactions, db.table.Transactions, db.table.Transactions, db.table.Transactions,
 		db.table.Movements, db.table.Requests, db.table.Movements, db.table.Movements, db.table.Movements, db.table.Movements,
 		db.table.TransactionEndorseAck, db.table.TransactionEndorseAck, db.table.TransactionEndorseAck,
-	)
+	) + db.getFindingsSchema()
 }
 
 func (db *TransactionStore) NewTransactionStoreTransaction() (dbdriver.TransactionStoreTransaction, error) {
@@ -607,7 +680,7 @@ func (w *TransactionStoreTransaction) Impl() dbdriver.TransactionImpl {
 
 func (w *TransactionStoreTransaction) Commit() error {
 	if err := w.txn.Commit(); err != nil {
-		return fmt.Errorf("could not commit transaction: %w", err)
+		return errors.Wrap(err, "could not commit transaction")
 	}
 	w.txn = nil
 
@@ -633,12 +706,13 @@ func (w *TransactionStoreTransaction) AddTransaction(ctx context.Context, rs ...
 	rows := make([]common3.Tuple, len(rs))
 	for i, r := range rs {
 		logger.DebugfContext(ctx, "adding transaction record [%s:%d,%s:%s:%s:%s]", r.TxID, r.ActionType, r.TokenType, r.SenderEID, r.RecipientEID, r.Amount)
-		id, err := uuid.GenerateUUID()
+		u, err := uuid.NewRandom()
 		if err != nil {
 			return errors.Wrapf(err, "error generating uuid")
 		}
-		if r.Amount.BitLen() > maxAmountBits {
-			return errors.Errorf("amount [%s] exceeds maximum supported size of %d bits", r.Amount, maxAmountBits)
+		id := u.String()
+		if err := validateAmount(r.Amount); err != nil {
+			return errors.WithMessagef(err, "invalid amount for record [%s]", r.TxID)
 		}
 		rows[i] = common3.Tuple{id, r.TxID, int(r.ActionType), r.SenderEID, r.RecipientEID, r.TokenType, r.Amount.String(), r.Timestamp.UTC()}
 	}
@@ -654,10 +728,21 @@ func (w *TransactionStoreTransaction) AddTransaction(ctx context.Context, rs ...
 	return ttxDBError(err)
 }
 
+// AddTokenRequest binds txID to the serialized token request tr.
+//
+// Verification: this layer is a byte store and does not interpret tr — the
+// wire-format and anchor checks live in the ttxdb and auditdb services, which
+// know which of the two token request formats they hold. What is refused here
+// is a row that no later check could act on: an empty transaction id, empty
+// request bytes, or an empty public parameters hash. See
+// docs/security/store_integrity_verification.md.
 func (w *TransactionStoreTransaction) AddTokenRequest(ctx context.Context, txID string, tr []byte, applicationMetadata, publicMetadata map[string][]byte, ppHash driver2.PPHash) error {
 	logger.DebugfContext(ctx, "adding token request [%s]", txID)
 	if w.txn == nil {
 		return errors.New("no db transaction in progress")
+	}
+	if err := integrity.CheckTokenRequestForStorage(txID, tr, ppHash); err != nil {
+		return errors.WithMessagef(err, "refusing to add token request for txid [%s]", txID)
 	}
 	if applicationMetadata == nil {
 		applicationMetadata = make(map[string][]byte)
@@ -699,12 +784,13 @@ func (w *TransactionStoreTransaction) AddMovement(ctx context.Context, rs ...dbd
 	rows := make([]common3.Tuple, len(rs))
 	for i, r := range rs {
 		logger.DebugfContext(ctx, "adding movement record [%s]", r)
-		id, err := uuid.GenerateUUID()
+		u, err := uuid.NewRandom()
 		if err != nil {
 			return errors.Wrapf(err, "error generating uuid")
 		}
-		if r.Amount.BitLen() > maxAmountBits {
-			return errors.Errorf("amount [%s] exceeds maximum supported size of %d bits", r.Amount, maxAmountBits)
+		id := u.String()
+		if err := validateAmount(r.Amount); err != nil {
+			return errors.WithMessagef(err, "invalid amount for record [%s]", r.TxID)
 		}
 		rows[i] = common3.Tuple{id, r.TxID, r.EnrollmentID, r.TokenType, r.Amount.String(), now}
 	}
@@ -752,8 +838,7 @@ func ttxDBError(err error) error {
 		return nil
 	}
 	logger.Error(err)
-	e := strings.ToLower(err.Error())
-	if strings.Contains(e, "foreign key constraint") {
+	if isForeignKeyViolation(err) {
 		return dbdriver.ErrTokenRequestDoesNotExist
 	}
 

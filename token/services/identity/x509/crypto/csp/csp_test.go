@@ -182,7 +182,7 @@ func TestHashOperations(t *testing.T) {
 		assert.NotEmpty(t, hash)
 		// Verify the hash matches the expected SHA3-256 value
 		h := hash0.Hash(sha30.New256())
-		h.Write(msg)
+		_, _ = h.Write(msg)
 		expectedHash := h.Sum(nil)
 		assert.Equal(t, expectedHash, hash)
 	})
@@ -194,7 +194,7 @@ func TestHashOperations(t *testing.T) {
 		assert.NotEmpty(t, hash)
 		// Verify the hash matches the expected SHA3-384 value
 		h := hash0.Hash(sha30.New384())
-		h.Write(msg)
+		_, _ = h.Write(msg)
 		expectedHash := h.Sum(nil)
 		assert.Equal(t, expectedHash, hash)
 	})
@@ -207,7 +207,7 @@ func TestHashOperations(t *testing.T) {
 		require.NoError(t, err)
 		assert.NotNil(t, h)
 
-		h.Write(msg)
+		_, _ = h.Write(msg)
 		hash := h.Sum(nil)
 		assert.NotEmpty(t, hash)
 		// Verify the hash matches the expected SHA256 value
@@ -461,6 +461,97 @@ func TestKeyMarshalling(t *testing.T) {
 		ecdsaParsedKey, ok := parsedKey.(*ecdsa.PublicKey)
 		assert.True(t, ok)
 		assert.NotNil(t, ecdsaParsedKey)
+	})
+}
+
+// Test that the ecdsa signer/verifiers return an error (rather than panicking) when
+// handed a bccsp.Key whose concrete type is not the one they expect.
+func TestECDSASignerVerifierWrongKeyType(t *testing.T) {
+	privKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	pub := &ecdsaPublicKey{&privKey.PublicKey}
+	priv := &ecdsaPrivateKey{privKey}
+	digest := sha256.Sum256([]byte("test"))
+
+	// ecdsaSigner expects *ecdsaPrivateKey; hand it a public key.
+	t.Run("Sign Wrong Key Type", func(t *testing.T) {
+		_, err := (&ecdsaSigner{}).Sign(pub, digest[:], nil)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "expected *ecdsaPrivateKey")
+	})
+
+	// ecdsaPrivateKeyVerifier expects *ecdsaPrivateKey; hand it a public key.
+	t.Run("Private Key Verifier Wrong Key Type", func(t *testing.T) {
+		valid, err := (&ecdsaPrivateKeyVerifier{}).Verify(pub, []byte("sig"), digest[:], nil)
+		require.Error(t, err)
+		assert.False(t, valid)
+		assert.Contains(t, err.Error(), "expected *ecdsaPrivateKey")
+	})
+
+	// ecdsaPublicKeyKeyVerifier expects *ecdsaPublicKey; hand it a private key.
+	t.Run("Public Key Verifier Wrong Key Type", func(t *testing.T) {
+		valid, err := (&ecdsaPublicKeyKeyVerifier{}).Verify(priv, []byte("sig"), digest[:], nil)
+		require.Error(t, err)
+		assert.False(t, valid)
+		assert.Contains(t, err.Error(), "expected *ecdsaPublicKey")
+	})
+}
+
+// TestECDSASignerVerifierNilKeyMaterial covers the typed-nil / nil-field case the
+// wrong-type assertions above do not catch: a key whose concrete type *is* the expected
+// one but which carries no key material (a typed-nil *ecdsaPrivateKey/*ecdsaPublicKey, or
+// one with a nil privKey/pubKey field) passes the `, ok` assertion, so without an explicit
+// guard the subsequent dereference panics the calling goroutine — the exact failure mode
+// #2068 set out to turn into a typed error.
+func TestECDSASignerVerifierNilKeyMaterial(t *testing.T) {
+	digest := sha256.Sum256([]byte("test"))
+
+	var nilPriv *ecdsaPrivateKey // typed-nil, still satisfies bccsp.Key
+	var nilPub *ecdsaPublicKey
+	emptyPriv := &ecdsaPrivateKey{privKey: nil}
+	emptyPub := &ecdsaPublicKey{pubKey: nil}
+
+	t.Run("Sign Typed-Nil Private Key", func(t *testing.T) {
+		require.NotPanics(t, func() {
+			_, err := (&ecdsaSigner{}).Sign(nilPriv, digest[:], nil)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "no private key material")
+		})
+	})
+
+	t.Run("Sign Nil Private Key Material", func(t *testing.T) {
+		require.NotPanics(t, func() {
+			_, err := (&ecdsaSigner{}).Sign(emptyPriv, digest[:], nil)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "no private key material")
+		})
+	})
+
+	t.Run("Private Key Verifier Typed-Nil", func(t *testing.T) {
+		require.NotPanics(t, func() {
+			valid, err := (&ecdsaPrivateKeyVerifier{}).Verify(nilPriv, []byte("sig"), digest[:], nil)
+			require.Error(t, err)
+			assert.False(t, valid)
+			assert.Contains(t, err.Error(), "no private key material")
+		})
+	})
+
+	t.Run("Public Key Verifier Typed-Nil", func(t *testing.T) {
+		require.NotPanics(t, func() {
+			valid, err := (&ecdsaPublicKeyKeyVerifier{}).Verify(nilPub, []byte("sig"), digest[:], nil)
+			require.Error(t, err)
+			assert.False(t, valid)
+			assert.Contains(t, err.Error(), "no public key material")
+		})
+	})
+
+	t.Run("Public Key Verifier Nil Material", func(t *testing.T) {
+		require.NotPanics(t, func() {
+			valid, err := (&ecdsaPublicKeyKeyVerifier{}).Verify(emptyPub, []byte("sig"), digest[:], nil)
+			require.Error(t, err)
+			assert.False(t, valid)
+			assert.Contains(t, err.Error(), "no public key material")
+		})
 	})
 }
 

@@ -28,11 +28,7 @@ import (
 // (from the table prefix), not injected by the test. See #1798.
 func TestTokenLockStore_AcquireCleanupLeadership_ConcurrentReplicas(t *testing.T) {
 	cfg := fscpostgres.DefaultConfig(fscpostgres.WithDBName("test-cleanup-leadership"))
-	terminate, _, err := fscpostgres.StartPostgres(t.Context(), cfg, nil)
-	if err != nil {
-		t.Skipf("postgres not available: %v", err)
-	}
-	t.Cleanup(terminate)
+	startPostgres(t, cfg)
 
 	db, err := sql.Open("pgx", cfg.DataSource())
 	require.NoError(t, err)
@@ -59,8 +55,9 @@ func TestTokenLockStore_AcquireCleanupLeadership_ConcurrentReplicas(t *testing.T
 	require.NoError(t, err)
 	require.NoError(t, replicaA.CreateSchema())
 
-	require.Equal(t, replicaA.cleanupLockID, replicaB.cleanupLockID,
-		"replicas for the same TMS must derive the same cleanup lock id")
+	// The cleanup lock id is bound into the leader factory at construction and is no longer a
+	// field, so the assertion that both replicas share it is the concurrent acquire below:
+	// exactly one of them can win only if they are contending over the same lock.
 
 	var wg sync.WaitGroup
 	results := make([]bool, 2)
@@ -106,11 +103,7 @@ func TestTokenLockStore_AcquireCleanupLeadership_ConcurrentReplicas(t *testing.T
 // TMS across the whole fleet would ever win cleanup on any tick. See #1798.
 func TestTokenLockStore_AcquireCleanupLeadership_DistinctTMS(t *testing.T) {
 	cfg := fscpostgres.DefaultConfig(fscpostgres.WithDBName("test-cleanup-leadership-distinct-tms"))
-	terminate, _, err := fscpostgres.StartPostgres(t.Context(), cfg, nil)
-	if err != nil {
-		t.Skipf("postgres not available: %v", err)
-	}
-	t.Cleanup(terminate)
+	startPostgres(t, cfg)
 
 	db, err := sql.Open("pgx", cfg.DataSource())
 	require.NoError(t, err)
@@ -141,14 +134,14 @@ func TestTokenLockStore_AcquireCleanupLeadership_DistinctTMS(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, tmsB.CreateSchema())
 
-	require.NotEqual(t, tmsA.cleanupLockID, tmsB.cleanupLockID,
+	require.NotEqual(t, tokenLockCleanupLockID(tablesA), tokenLockCleanupLockID(tablesB),
 		"distinct TMSes must derive distinct cleanup lock ids, or one TMS's cleanup would starve the other's")
 	require.NotEqual(t, tmsA.lockID, tmsB.lockID,
 		"distinct TMSes must derive distinct schema-creation lock ids too - a regression back to a "+
-			"prefix-only or global constant would pass the cleanupLockID check above but not this one")
-	require.NotEqual(t, tmsA.lockID, tmsA.cleanupLockID,
+			"prefix-only or global constant would pass the cleanup lock id check above but not this one")
+	require.NotEqual(t, tmsA.lockID, tokenLockCleanupLockID(tablesA),
 		"schema-creation and cleanup locks on the same store must be distinct")
-	require.NotEqual(t, tmsB.lockID, tmsB.cleanupLockID,
+	require.NotEqual(t, tmsB.lockID, tokenLockCleanupLockID(tablesB),
 		"schema-creation and cleanup locks on the same store must be distinct")
 
 	// both should acquire leadership independently and concurrently, since

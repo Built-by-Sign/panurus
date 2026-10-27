@@ -83,12 +83,14 @@ func NewLedger(ch *fabric.Channel, network string, keyTranslator translator.KeyT
 }
 
 // Status retrieves the validation status of a transaction from the Fabric ledger.
-func (l *ledger) Status(id string) (driver.ValidationCode, error) {
+// FSC's underlying Ledger.GetTransactionByID takes no context, so ctx cannot bound the
+// query itself; it is used only for context-aware logging.
+func (l *ledger) Status(ctx context.Context, id string) (driver.ValidationCode, error) {
 	tx, err := l.l.GetTransactionByID(id)
 	if err != nil {
 		return driver.Unknown, errors.Wrapf(err, "failed to get transaction [%s]", id)
 	}
-	logger.Debugf("ledger status of [%s] is [%d]", id, tx.ValidationCode())
+	logger.DebugfContext(ctx, "ledger status of [%s] is [%d]", id, tx.ValidationCode())
 	switch peer.TxValidationCode(tx.ValidationCode()) {
 	case peer.TxValidationCode_VALID:
 		return driver.Valid, nil
@@ -458,7 +460,8 @@ func (n *Network) connect(ns string) ([]token2.ServiceOption, error) {
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed to get ttx storage for [%s]", tmsID)
 		}
-		_, err = n.createRecoveryManager(tmsID, storage, tokensService)
+		_, err = n.createRecoveryManager(tmsID, storage, tokensService,
+			ttxfinality.NewSelectorManagerProvider(wrapper.NewTokenManagementServiceProvider(n.tmsProvider), tmsID))
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed to create recovery manager for ttx storage for [%s]", tmsID)
 		}
@@ -469,7 +472,9 @@ func (n *Network) connect(ns string) ([]token2.ServiceOption, error) {
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed to get audit storage for [%s]", tmsID)
 		}
-		_, err = n.createRecoveryManager(tmsID, storage, tokensService)
+		// An auditor holds no selection locks for the transactions it audited: see
+		// createRecoveryManager.
+		_, err = n.createRecoveryManager(tmsID, storage, tokensService, ttxfinality.NewNoSelectorManagerProvider())
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed to create recovery manager for audit storage for [%s]", tmsID)
 		}
@@ -485,7 +490,21 @@ func (n *Network) connect(ns string) ([]token2.ServiceOption, error) {
 }
 
 // createRecoveryManager initializes and starts the recovery manager for the given namespace
-func (n *Network) createRecoveryManager(tmsID token2.TMSID, storage transactionDB, tokensService *tokens.Service) (*recovery2.Manager, error) {
+// createRecoveryManager builds and starts the recovery sweep over one store.
+//
+// selectorManagers is passed in rather than derived here because it depends on the store's
+// role, not on the TMS: only transactions this node selected tokens for hold selection locks
+// to release (#2395 mechanism 4). The transaction store gets the real provider; the audit
+// store, which tracks transactions assembled and spent elsewhere that this node merely
+// audited, gets ttxfinality.NewNoSelectorManagerProvider() - resolving a selector manager
+// there could at best delete zero rows, and would log a warning per recovered transaction on
+// a TMS with no usable selector manager.
+func (n *Network) createRecoveryManager(
+	tmsID token2.TMSID,
+	storage transactionDB,
+	tokensService *tokens.Service,
+	selectorManagers selectorManagerProvider,
+) (*recovery2.Manager, error) {
 	// Get TMS configuration
 	cfg, err := n.configuration.ConfigurationFor(tmsID.Network, tmsID.Channel, tmsID.Namespace)
 	if err != nil {
@@ -514,6 +533,7 @@ func (n *Network) createRecoveryManager(tmsID token2.TMSID, storage transactionD
 		tmsID,
 		storage,
 		tokensService,
+		selectorManagers,
 		n.finalityTracer,
 		n.metricsProvider,
 	)
@@ -621,9 +641,9 @@ type setupListenerProvider struct {
 func (p *setupListenerProvider) GetListener(tmsID token2.TMSID) lookup.Listener {
 	return &setupListener{
 		GetTMSProvider: func() *token2.ManagementServiceProvider { return p.tmsProvider },
-		GetTokens: lazy.NewGetter[*tokens.Service](func() (*tokens.Service, error) {
+		GetTokens: lazy.NewHolder[*tokens.Service](func() (*tokens.Service, error) {
 			return p.tokensProvider.ServiceByTMSId(tmsID)
-		}).Get,
+		}, nil).Get,
 		TMSID: tmsID,
 	}
 }
@@ -656,12 +676,20 @@ func (s *setupListener) OnError(ctx context.Context, key string, err error) {
 	logger.Warnf("setup listener error for TMS [%s] key [%s]: [%v]", s.TMSID, key, err)
 }
 
+// selectorManagerProvider is what releasing a recovered transaction's selection locks needs: a
+// way to reach the TMS's selector manager. It is declared here because the recovery handler's
+// own view of it is unexported, and because the two recovery managers this file starts are
+// given different ones - see createRecoveryManager.
+type selectorManagerProvider interface {
+	SelectorManager() (token2.SelectorManager, error)
+}
+
 type transactionDB interface {
 	NewTransaction() (storage.TransactionStoreTransaction, error)
 	GetTokenRequest(ctx context.Context, txID string) ([]byte, error)
 	SetStatus(ctx context.Context, txID string, status storage.TxStatus, message string) error
 	NotifyStatus(ctx context.Context, txID string, status storage.TxStatus, message string)
-	AcquireRecoveryLeadership(ctx context.Context, lockID int64) (recovery2.Leadership, bool, error)
+	AcquireRecoveryLeadership(ctx context.Context) (recovery2.Leadership, bool, error)
 	ClaimPendingTransactions(ctx context.Context, olderThan time.Duration, leaseDuration time.Duration, limit int, owner string) ([]*ttxdb.RecoveryClaim, error)
 	ReleaseRecoveryClaim(ctx context.Context, txID string, owner string, message string) error
 }

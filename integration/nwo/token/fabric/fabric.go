@@ -23,6 +23,7 @@ import (
 	"github.com/LFDT-Panurus/panurus/token"
 	"github.com/LFDT-Panurus/panurus/token/services/logging"
 	api2 "github.com/hyperledger-labs/fabric-smart-client/integration/nwo/api"
+	fabricopts "github.com/hyperledger-labs/fabric-smart-client/integration/nwo/fabric/opts"
 	"github.com/hyperledger-labs/fabric-smart-client/integration/nwo/fsc"
 	sfcnode "github.com/hyperledger-labs/fabric-smart-client/integration/nwo/fsc/node"
 	"github.com/onsi/gomega"
@@ -38,8 +39,25 @@ type Entry struct {
 
 type Backend interface {
 	PrepareNamespace(tms *topology2.TMS)
-	UpdatePublicParams(tms *topology2.TMS, raw []byte)
-	InstallPublicParams(tms *topology2.TMS, raw []byte)
+	UpdatePublicParams(tms *topology2.TMS, raw []byte) error
+	InstallPublicParams(tms *topology2.TMS, raw []byte) error
+}
+
+// PublicParamsInstallWatcher is implemented by backends that defer the installation of the
+// public parameters and can report the outcome of that work after InstallPublicParams has
+// returned.
+type PublicParamsInstallWatcher interface {
+	// HasPublicParamsInstall reports whether InstallPublicParams was ever called for tms.
+	HasPublicParamsInstall(tms *topology2.TMS) bool
+	// WaitForPublicParams blocks until the deferred installation of the public parameters of
+	// tms has finished and returns its outcome, waiting at most timeout. It returns an error if
+	// the installation did not finish within timeout (for example because it was recorded but
+	// never performed) or if no installation was ever recorded for tms. A zero timeout makes it
+	// a non-blocking check that never waits.
+	WaitForPublicParams(tms *topology2.TMS, timeout time.Duration) error
+	// PublicParamsInstallTimeout returns how long a single deferred installation may take, so
+	// that a caller draining one still in flight can bound its wait without guessing.
+	PublicParamsInstallTimeout() time.Duration
 }
 
 type NetworkHandler struct {
@@ -50,16 +68,14 @@ type NetworkHandler struct {
 
 func NewNetworkHandler(tokenPlatform common2.TokenPlatform, builder api2.Builder, backend Backend) *NetworkHandler {
 	return &NetworkHandler{
-		NetworkHandler: common2.NetworkHandler{
-			TokenPlatform:     tokenPlatform,
-			EventuallyTimeout: 10 * time.Minute,
-			CryptoMaterialGenerators: map[string]generators.CryptoMaterialGenerator{
-				fabtokenv1.DriverIdentifier:     fabtokenv1.NewCryptoMaterialGenerator(tokenPlatform, builder),
-				zkatdlognoghv1.DriverIdentifier: zkatdlognoghv1.NewCryptoMaterialGenerator(tokenPlatform, math3.BN254, builder),
-			},
-			CASupports: map[string]common2.CAFactory{
-				zkatdlognoghv1.DriverIdentifier: common2.NewIdemixCASupport,
-			},
+		TokenPlatform:     tokenPlatform,
+		EventuallyTimeout: 10 * time.Minute,
+		CryptoMaterialGenerators: map[string]generators.CryptoMaterialGenerator{
+			fabtokenv1.DriverIdentifier:     fabtokenv1.NewCryptoMaterialGenerator(tokenPlatform, builder),
+			zkatdlognoghv1.DriverIdentifier: zkatdlognoghv1.NewCryptoMaterialGenerator(tokenPlatform, math3.BN254, builder),
+		},
+		CASupports: map[string]common2.CAFactory{
+			zkatdlognoghv1.DriverIdentifier: common2.NewIdemixCASupport,
 		},
 		Entries: map[string]*Entry{},
 		Backend: backend,
@@ -130,6 +146,7 @@ func (p *NetworkHandler) GenerateExtension(tms *topology2.TMS, node *sfcnode.Nod
 		"EndorserID":            func() string { return "" },
 		"Endorser":              func() bool { return topology2.ToOptions(node.Options).Endorser() },
 		"EndorsementPolicyType": func() string { return FSCEndorsementPolicyType(tms) },
+		"EndorserSelection":     func() []string { return EndorserSelectionFor(tms, node) },
 	}).Parse(Extension)
 	gomega.Expect(err).NotTo(gomega.HaveOccurred())
 
@@ -138,6 +155,35 @@ func (p *NetworkHandler) GenerateExtension(tms *topology2.TMS, node *sfcnode.Nod
 	gomega.Expect(err).NotTo(gomega.HaveOccurred())
 
 	return ext.String()
+}
+
+// EndorserSelectionFor returns the MSP IDs that node must restrict Token Chaincode
+// endorsement to for the given TMS, which the TMS extension writes to
+// services.network.fabric.endorsement.mspIDs. It returns nil when the TMS configures no
+// selection, and for a node with no Fabric organization, which has nothing to select.
+func EndorserSelectionFor(tms *topology2.TMS, node *sfcnode.Node) []string {
+	if !EndorsersFromOwnOrg(tms) {
+		return nil
+	}
+
+	var mspIDs []string
+	seen := map[string]struct{}{}
+	for _, organization := range fabricopts.Get(node.PlatformOpts()).Organizations() {
+		// A node may be registered in more than one network; only this TMS's network
+		// decides which peers may endorse its invocations. An entry with no network is one
+		// added with fabric.WithOrganization, which applies to the default network.
+		if len(organization.Network) > 0 && organization.Network != tms.Network {
+			continue
+		}
+		mspID := organization.Org + "MSP"
+		if _, duplicate := seen[mspID]; duplicate {
+			continue
+		}
+		seen[mspID] = struct{}{}
+		mspIDs = append(mspIDs, mspID)
+	}
+
+	return mspIDs
 }
 
 func (p *NetworkHandler) PostRun(load bool, tms *topology2.TMS) {
@@ -149,7 +195,14 @@ func (p *NetworkHandler) PostRun(load bool, tms *topology2.TMS) {
 		}
 	}
 
-	p.Backend.InstallPublicParams(tms, p.TokenPlatform.PublicParameters(tms))
+	// Do not wait for the installation to complete here: the backend may need the FSC nodes
+	// to be up, and the token platform is not an FSC platform, so NWO calls its PostRun
+	// before it starts them. Waiting would deadlock the bring-up and let the installation
+	// run out of its retry budget. A backend that defers the installation performs it once
+	// the network is up, and its outcome is collected later, in UpdatePublicParams and
+	// Cleanup.
+	err := p.Backend.InstallPublicParams(tms, p.TokenPlatform.PublicParameters(tms))
+	gomega.Expect(err).ToNot(gomega.HaveOccurred(), "failed installing public params for [%s]", tms.ID())
 }
 
 func (p *NetworkHandler) Cleanup() {
@@ -157,11 +210,50 @@ func (p *NetworkHandler) Cleanup() {
 		if entry.CA != nil {
 			entry.CA.Stop()
 		}
+		// Report a deferred public params installation that failed after PostRun returned, so
+		// that it does not go unnoticed. Raising a gomega assertion here would hide the actual
+		// test failures, so log instead. Entries that never had an installation recorded
+		// (e.g. suite aborted before PostRun) are skipped. A zero timeout keeps teardown from
+		// blocking: by now the installation has normally finished, and a still-open one (a suite
+		// that recorded work but never performed it) is reported at once rather than waited on.
+		if err := p.pendingInstallError(entry.TMS, 0); err != nil {
+			logger.Errorf("public params installation for [%s] failed: %v", entry.TMS.ID(), err)
+		}
 	}
 }
 
 func (p *NetworkHandler) UpdatePublicParams(tms *topology2.TMS, ppRaw []byte) {
-	p.Backend.UpdatePublicParams(tms, ppRaw)
+	// a failed deferred installation is the most likely cause of a failing update, and it carries
+	// the original error, so drain it and report it first. Wait for one still in flight, since an
+	// update issued before its parameters are installed would fail anyway.
+	err := p.pendingInstallError(tms, p.publicParamsInstallTimeout())
+	gomega.Expect(err).ToNot(gomega.HaveOccurred(), "public params installation for [%s] failed", tms.ID())
+
+	err = p.Backend.UpdatePublicParams(tms, ppRaw)
+	gomega.Expect(err).ToNot(gomega.HaveOccurred(), "failed updating public params for [%s]", tms.ID())
+}
+
+// pendingInstallError returns the outcome of the deferred public params installation for tms, if
+// the backend tracks one, waiting up to timeout for one still in flight to finish. It returns nil
+// when the backend does not defer installations or recorded none for tms.
+func (p *NetworkHandler) pendingInstallError(tms *topology2.TMS, timeout time.Duration) error {
+	watcher, ok := p.Backend.(PublicParamsInstallWatcher)
+	if !ok || !watcher.HasPublicParamsInstall(tms) {
+		return nil
+	}
+
+	return watcher.WaitForPublicParams(tms, timeout)
+}
+
+// publicParamsInstallTimeout is how long to wait for a deferred installation still in flight,
+// taken from the backend when it exposes its own bound and zero otherwise (a non-watcher backend,
+// for which pendingInstallError does not wait at all).
+func (p *NetworkHandler) publicParamsInstallTimeout() time.Duration {
+	if watcher, ok := p.Backend.(PublicParamsInstallWatcher); ok {
+		return watcher.PublicParamsInstallTimeout()
+	}
+
+	return 0
 }
 
 func (p *NetworkHandler) GenIssuerCryptoMaterial(tms *topology2.TMS, nodeID string, walletID string) string {

@@ -10,9 +10,12 @@ import (
 	"context"
 	"testing"
 
+	"github.com/LFDT-Panurus/panurus/token/core/common/metrics"
 	"github.com/LFDT-Panurus/panurus/token/sdk/db"
 	"github.com/LFDT-Panurus/panurus/token/services/storage/db/common"
 	"github.com/LFDT-Panurus/panurus/token/services/storage/db/common/mock"
+	"github.com/LFDT-Panurus/panurus/token/services/storage/db/guard"
+	"github.com/LFDT-Panurus/panurus/token/services/storage/services/checks"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/dig"
@@ -30,7 +33,10 @@ func TestNewAuditorCheckServiceProvider(t *testing.T) {
 		dig.In
 		TMSProvider     common.TokenManagementServiceProvider
 		NetworkProvider common.NetworkProvider
+		Configuration   checks.Configuration
+		MetricsProvider metrics.Provider
 		Checkers        []common.NamedChecker `group:"auditdb-checkers"`
+		Policy          guard.Policy
 	}{
 		TMSProvider:     tmsProvider,
 		NetworkProvider: networkProvider,
@@ -51,7 +57,10 @@ func TestNewAuditorCheckServiceProvider_EmptyCheckers(t *testing.T) {
 		dig.In
 		TMSProvider     common.TokenManagementServiceProvider
 		NetworkProvider common.NetworkProvider
+		Configuration   checks.Configuration
+		MetricsProvider metrics.Provider
 		Checkers        []common.NamedChecker `group:"auditdb-checkers"`
+		Policy          guard.Policy
 	}{
 		TMSProvider:     tmsProvider,
 		NetworkProvider: networkProvider,
@@ -77,7 +86,10 @@ func TestNewAuditorCheckServiceProvider_MultipleCheckers(t *testing.T) {
 		dig.In
 		TMSProvider     common.TokenManagementServiceProvider
 		NetworkProvider common.NetworkProvider
+		Configuration   checks.Configuration
+		MetricsProvider metrics.Provider
 		Checkers        []common.NamedChecker `group:"auditdb-checkers"`
+		Policy          guard.Policy
 	}{
 		TMSProvider:     tmsProvider,
 		NetworkProvider: networkProvider,
@@ -102,7 +114,10 @@ func TestNewOwnerCheckServiceProvider(t *testing.T) {
 		dig.In
 		TMSProvider     common.TokenManagementServiceProvider
 		NetworkProvider common.NetworkProvider
+		Configuration   checks.Configuration
+		MetricsProvider metrics.Provider
 		Checkers        []common.NamedChecker `group:"ttxdb-checkers"`
+		Policy          guard.Policy
 	}{
 		TMSProvider:     tmsProvider,
 		NetworkProvider: networkProvider,
@@ -123,7 +138,10 @@ func TestNewOwnerCheckServiceProvider_EmptyCheckers(t *testing.T) {
 		dig.In
 		TMSProvider     common.TokenManagementServiceProvider
 		NetworkProvider common.NetworkProvider
+		Configuration   checks.Configuration
+		MetricsProvider metrics.Provider
 		Checkers        []common.NamedChecker `group:"ttxdb-checkers"`
+		Policy          guard.Policy
 	}{
 		TMSProvider:     tmsProvider,
 		NetworkProvider: networkProvider,
@@ -149,7 +167,10 @@ func TestNewOwnerCheckServiceProvider_MultipleCheckers(t *testing.T) {
 		dig.In
 		TMSProvider     common.TokenManagementServiceProvider
 		NetworkProvider common.NetworkProvider
+		Configuration   checks.Configuration
+		MetricsProvider metrics.Provider
 		Checkers        []common.NamedChecker `group:"ttxdb-checkers"`
+		Policy          guard.Policy
 	}{
 		TMSProvider:     tmsProvider,
 		NetworkProvider: networkProvider,
@@ -171,7 +192,10 @@ func TestNewAuditorCheckServiceProvider_WithNilProviders(t *testing.T) {
 		dig.In
 		TMSProvider     common.TokenManagementServiceProvider
 		NetworkProvider common.NetworkProvider
+		Configuration   checks.Configuration
+		MetricsProvider metrics.Provider
 		Checkers        []common.NamedChecker `group:"auditdb-checkers"`
+		Policy          guard.Policy
 	}{
 		TMSProvider:     nil,
 		NetworkProvider: nil,
@@ -193,7 +217,10 @@ func TestNewOwnerCheckServiceProvider_WithNilProviders(t *testing.T) {
 		dig.In
 		TMSProvider     common.TokenManagementServiceProvider
 		NetworkProvider common.NetworkProvider
+		Configuration   checks.Configuration
+		MetricsProvider metrics.Provider
 		Checkers        []common.NamedChecker `group:"ttxdb-checkers"`
+		Policy          guard.Policy
 	}{
 		TMSProvider:     nil,
 		NetworkProvider: nil,

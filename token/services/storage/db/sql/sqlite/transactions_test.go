@@ -20,14 +20,10 @@ func mockTransactionsStore(db *sql.DB) *common2.TransactionStore {
 		Requests:              "REQUESTS",
 		Validations:           "VALIDATIONS",
 		TransactionEndorseAck: "TRANSACTION_ENDORSE_ACK",
+		Findings:              "FINDINGS",
 	}, NewConditionInterpreter(), NewPaginationInterpreter())
 
 	return store
-}
-
-var queryConstructorTraits = common2.QueryConstructorTraits{
-	SupportsIN:          true,
-	MultipleParenthesis: false,
 }
 
 func TestGetTokenRequest(t *testing.T) {
@@ -35,7 +31,7 @@ func TestGetTokenRequest(t *testing.T) {
 }
 
 func TestQueryMovements(t *testing.T) {
-	common2.TestQueryMovements(t, mockTransactionsStore, queryConstructorTraits)
+	common2.TestQueryMovements(t, mockTransactionsStore)
 }
 
 func TestQueryTransactions(t *testing.T) {
@@ -47,11 +43,19 @@ func TestGetStatus(t *testing.T) {
 }
 
 func TestQueryTokenRequests(t *testing.T) {
-	common2.TestQueryTokenRequests(t, mockTransactionsStore, queryConstructorTraits)
+	common2.TestQueryTokenRequests(t, mockTransactionsStore)
 }
 
 func TestGetTransactionEndorsementAcks(t *testing.T) {
 	common2.TestGetTransactionEndorsementAcks(t, mockTransactionsStore)
+}
+
+func TestCountOpenFindings(t *testing.T) {
+	common2.TestCountOpenFindings(t, mockTransactionsStore)
+}
+
+func TestCountOpenFindings_NoOpenFindings(t *testing.T) {
+	common2.TestCountOpenFindings_NoOpenFindings(t, mockTransactionsStore)
 }
 
 func TestAddTransactionEndorsementAck(t *testing.T) {

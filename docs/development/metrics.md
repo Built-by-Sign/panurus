@@ -70,8 +70,9 @@ declared in `token/services/identity/idemix/cache/metrics.go`, yet exported as
 
 The wiring that decides this is the driver setup in
 `token/core/{fabtoken/v1,zkatdlog/nogh/v1}/driver/driver.go`, which builds a TMS-scoped provider and
-passes it to the driver services and the wallet service. Everything reached from the
-dependency-injection container instead keeps its own package prefix.
+passes it to the driver services and the wallet service, and `token/sdk/db/checks.go`, which does the
+same for the ledger drift checks sweep. Everything reached from the dependency-injection container
+instead keeps its own package prefix.
 
 Two rules follow for anyone adding a metric:
 
@@ -167,9 +168,9 @@ labels**, so a node auditing several TMSs reports them aggregated; see
 | Metric | Type | Labels | Description |
 |---|---|---|---|
 | `panurus_services_auditor_auditor_audit_duration_seconds` | histogram | — | Histogram of Audit() processing time per transaction (including lock acquisition), in seconds |
-| `panurus_services_auditor_auditor_audit_lock_conflicts_total` | counter | — | Total number of Audit() calls that failed to acquire enrollment-ID locks |
+| `panurus_services_auditor_auditor_audit_lock_conflicts_total` | counter | — | Total number of Audit() and Append() calls that failed to acquire enrollment-ID locks |
 | `panurus_services_auditor_auditor_append_duration_seconds` | histogram | — | Histogram of Append() processing time per transaction, in seconds |
-| `panurus_services_auditor_auditor_append_errors_total` | counter | — | Total number of Append() calls that failed to write to the audit database |
+| `panurus_services_auditor_auditor_append_errors_total` | counter | — | Total number of Append() calls that failed to store the audit record |
 | `panurus_services_auditor_auditor_releases_total` | counter | — | Total number of Release() calls (explicit and deferred) |
 
 Source: `token/services/auditor/metrics.go`.
@@ -178,7 +179,63 @@ Source: `token/services/auditor/metrics.go`.
 
 Recorded by the default token selector. `outcome` is one of `success`, `insufficient_funds`,
 `locked_funds` or `error`; `fetcher_type` is `eager` or `lazy`. `selection_immediate_retries` shows how
-often a selection had to retry because of concurrent lock contention.
+often a selection had to retry because of concurrent lock contention. `lock_conflicts_total` and
+`distinct_tokens_attempted` were added for [#2395](https://github.com/LFDT-Panurus/panurus/issues/2395)
+to distinguish "one hot token retried many times" from "many tokens each contended once";
+`lock_conflicts_total` is deliberately unlabeled by token id or wallet id to avoid unbounded
+cardinality — per-token attribution belongs in the selector's debug-level log line (`Lost lock
+race on token [...]`, visible once the sherdlock package's logger is at debug level) and in the
+[`tokendiag locks`](../../cmd/tokendiag/README.md) command. `lock_store_errors_total` (also
+#2395) counts the sibling case: a TryLock/TryLockBatch failure that is *not* a lock conflict (does
+not wrap `driver.ErrTokenAlreadyLocked`) — a genuine store error such as a connection failure or
+timeout. To the caller both currently surface identically as retried, eventually-locked-funds
+contention, so this counter is what distinguishes "the store is unhealthy" from "tokens are just
+contended" without changing that retry behavior.
+
+`stale_candidates_total` (also #2395) counts the third case, which is neither: a candidate
+dropped because the token was no longer spendable by the time the lock was attempted
+(`driver.ErrTokenNotSpendable`). The eager fetcher serves candidates from a snapshot of the
+token store, so a token spent after that snapshot was taken is still offered until the cache
+refreshes; the lock is conditional on the token still being spendable, so such a candidate is
+rejected rather than handed to a caller that could not load it. A non-zero rate here therefore
+means the cache's freshness interval is long relative to how fast the wallet is spending, not
+that tokens are contended or that the store is unhealthy.
+
+**Both lock paths report it.** A batch-capable backend — Postgres, via `LockBatch`, currently
+the only implementation — claims a whole window of candidates in one statement, and that
+statement classifies each candidate it did not win: the ones it refused as no longer spendable
+come back as such, and "another claimant holds it" is the remainder. So a stale candidate on the
+batch path is counted here, dropped for good, and used to refresh the candidate cache, exactly
+as on the single-token path — which also means a selection no longer has to wait for the eager
+cache's own `freshnessInterval` to recover from one.
+
+A backend is still allowed to win or not win a candidate without saying why; a selector treats
+every unwon candidate from one of those as a lost race. On such a deployment
+`stale_candidates_total` stays at zero *even during a stale-candidate episode*, and the symptom
+to read is `lock_conflicts_total` rising without a corresponding rise in real contention (e.g.
+with `distinct_tokens_attempted` flat and no competing senders). Neither correctness nor
+recovery depends on the classification — a token the store refuses is never handed to a caller,
+and a scan that comes up short refreshes the candidate cache whatever the store could say about
+why (see `cache_invalidations_total` below) — the difference is purely in what is reported.
+
+`cache_invalidations_total` (#2395) counts the forced refreshes those recoveries cost: each one
+is the selector telling its candidate source that the source's snapshot is behind the store, so
+the next read of it re-queries. It is raised by a stale candidate, and by a scan that ran out of
+candidates before covering the request — the candidate query hides tokens locked by others, so a
+lock released since the snapshot was taken cannot appear by re-reading it. The invalidation
+itself issues no query; it turns the *next* read into a full refresh for the eager and mixed
+strategies, and several invalidations before that read collapse into one. The first fetch of a
+selection is exempt, so a request served by its first scan costs nothing here; per `Select` the
+count is bounded by `selection_immediate_retries` plus one per stale candidate. A rate near that
+bound on most calls means the freshness interval is long relative to how fast the wallets turn
+over, and the eager strategy is paying for a snapshot it cannot keep — `fetcherStrategy: lazy`
+(or a shorter `fetcherCacheRefresh`) is then the cheaper configuration.
+
+For `StubbornSelector`, both `selection_immediate_retries` and `distinct_tokens_attempted` are
+observed once per outer `Select()` call, aggregated over every internal backoff-retry attempt it
+makes — not once per attempt. They aggregate differently: `selection_immediate_retries` counts
+events and so sums the per-attempt counts, while `distinct_tokens_attempted` counts distinct
+tokens and so unions them, meaning a token contended across several attempts is counted once.
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
@@ -186,6 +243,11 @@ often a selection had to retry because of concurrent lock contention.
 | `panurus_services_selector_sherdlock_selection_duration_seconds` | histogram | — | Duration of a token selection call in seconds |
 | `panurus_services_selector_sherdlock_selection_outcome_total` | counter | `outcome` | Total number of token selection outcomes by result type |
 | `panurus_services_selector_sherdlock_selection_immediate_retries` | histogram | — | Distribution of immediate retry counts per token selection call |
+| `panurus_services_selector_sherdlock_lock_conflicts_total` | counter | — | Total number of lost lock races (a token was already locked by another process) |
+| `panurus_services_selector_sherdlock_distinct_tokens_attempted` | histogram | — | Distribution of the number of distinct tokens a lock was attempted on (won, lost, or rate-limited) per token selection call |
+| `panurus_services_selector_sherdlock_lock_store_errors_total` | counter | — | Total number of TryLock/TryLockBatch failures that are not lock conflicts (a genuine store error) |
+| `panurus_services_selector_sherdlock_stale_candidates_total` | counter | — | Total number of candidate tokens dropped because they were no longer spendable when the lock was attempted |
+| `panurus_services_selector_sherdlock_cache_invalidations_total` | counter | — | Total number of times the candidate source was told its snapshot is behind the token store, forcing the next read to refresh it |
 
 Source: `token/services/selector/sherdlock/metrics.go`.
 
@@ -230,6 +292,43 @@ path while the identity backend keeps failing; the corresponding log line alone 
 
 Source: `token/services/identity/metrics.go`, `token/services/identity/idemix/cache/metrics.go`,
 `token/services/identity/role/metrics.go`.
+
+## Wallet service
+
+Recorded by the observability decorator in `token/services/observability/`, which wraps the wallet
+service and per-wallet instances (`OwnerWallet`, `IssuerWallet`, `AuditorWallet`, `CertifierWallet`)
+with metrics and circuit breaking. Both driver paths (FabToken and ZKAT-DLog) receive a TMS-scoped
+provider, hence the `panurus_core_common_metrics_` prefix. All metrics carry `wallet_id` to prevent
+metric collisions across wallets.
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `panurus_core_common_metrics_wallet_requests_total` | counter | `network,channel,namespace,method,wallet_id` | Total number of wallet service requests |
+| `panurus_core_common_metrics_wallet_errors_total` | counter | `network,channel,namespace,method,wallet_id` | Total number of wallet service errors |
+| `panurus_core_common_metrics_wallet_request_duration_seconds` | histogram | `network,channel,namespace,method,wallet_id` | Execution duration of wallet service operations in seconds |
+| `panurus_core_common_metrics_wallet_inflight_requests` | gauge | `network,channel,namespace,method,wallet_id` | Current number of in-flight wallet service requests |
+| `panurus_core_common_metrics_wallet_circuit_breaker_rejections_total` | counter | `network,channel,namespace,method,wallet_id` | Total number of requests rejected by the circuit breaker |
+| `panurus_core_common_metrics_wallet_circuit_breaker_state` | gauge | `network,channel,namespace,method,wallet_id` | Current circuit breaker state (0=Closed, 1=Open, 2=HalfOpen) |
+
+Source: `token/services/observability/metrics.go`. Wired in `token/core/{fabtoken/v1,zkatdlog/nogh/v1}/driver/driver.go`.
+
+## Ledger drift checks
+
+Recorded by the background sweep in `token/services/storage/services/checks`, wired up from
+`token/sdk/db/checks.go` through the TMS-scoped provider — hence the `panurus_core_common_metrics_`
+prefix despite living under `token/services/storage`. `role` is `owner` or `auditor`, naming which
+store a sweep covers; `outcome` is `completed`, `not_leader`, `canceled` or `failed`. See
+[Ledger Drift Checks](../services/storage/checks.md) for what the checks themselves look at.
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `panurus_core_common_metrics_storage_checks_sweep_duration_seconds` | histogram | `network,channel,namespace,role` | Histogram of the wall-clock time of one ledger drift checks sweep, in seconds |
+| `panurus_core_common_metrics_storage_checks_sweeps_total` | counter | `network,channel,namespace,role,outcome` | Total number of ledger drift checks sweeps by outcome (completed, not_leader, canceled, failed) |
+| `panurus_core_common_metrics_storage_checks_findings_observed_total` | counter | `network,channel,namespace,role,checker,code,severity` | Total number of ledger drift findings reported, by check, code and severity |
+| `panurus_core_common_metrics_storage_checks_findings_open` | gauge | `network,channel,namespace,role,severity` | Number of currently open ledger drift findings, by severity |
+| `panurus_core_common_metrics_storage_checks_findings_resolved_total` | counter | `network,channel,namespace,role` | Total number of stored ledger drift findings closed because a sweep stopped reporting them |
+
+Source: `token/services/storage/services/checks/metrics.go`.
 
 ## Fabric-X finality queue
 

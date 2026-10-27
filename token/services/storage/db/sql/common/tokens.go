@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"math/big"
 	"runtime/debug"
-	"strings"
 	"sync"
 	"time"
 
@@ -23,12 +22,12 @@ import (
 	q "github.com/LFDT-Panurus/panurus/token/services/storage/db/sql/query"
 	common3 "github.com/LFDT-Panurus/panurus/token/services/storage/db/sql/query/common"
 	"github.com/LFDT-Panurus/panurus/token/services/storage/db/sql/query/cond"
+	"github.com/LFDT-Panurus/panurus/token/services/storage/integrity"
 	"github.com/LFDT-Panurus/panurus/token/services/utils"
 	"github.com/LFDT-Panurus/panurus/token/token"
 	"github.com/hyperledger-labs/fabric-smart-client/pkg/utils/errors"
 	"github.com/hyperledger-labs/fabric-smart-client/platform/common/utils/collections"
 	"github.com/hyperledger-labs/fabric-smart-client/platform/common/utils/collections/iterators"
-	common2 "github.com/hyperledger-labs/fabric-smart-client/platform/view/services/storage/driver/common"
 	"github.com/hyperledger-labs/fabric-smart-client/platform/view/services/storage/driver/sql/common"
 )
 
@@ -39,15 +38,19 @@ type tokenTables struct {
 	Certifications   string
 	Requests         string
 	TokenSKICleanups string
+	// TokenLocks is only used by buildSpendableTokensIteratorByQuery's
+	// anti-join against already-locked tokens (#2395); no other TokenStore
+	// query touches it.
+	TokenLocks string
 }
 
 type TokenStore struct {
 	readDB               *sql.DB
-	writeDB              *sql.DB
+	writeDB              WriteDB
 	table                tokenTables
 	ci                   common3.CondInterpreter
 	notifier             driver.TokenNotifier
-	cleanupLeaderFactory func(context.Context, *sql.DB, int64) (driver.CleanupLeadership, bool, error)
+	cleanupLeaderFactory func(context.Context, WriteDB) (driver.CleanupLeadership, bool, error)
 
 	sttMutex              sync.RWMutex
 	supportedTokenFormats []token.Format
@@ -57,18 +60,19 @@ type TokenStore struct {
 	// present/absent). See #1183.
 	unspentTokensStmts PreparedStmtHolder[string]
 
-	// spendableTokensStmts caches prepared statements for
-	// SpendableTokensIteratorBy, keyed the same way. See #1919.
+	// spendableTokensStmts caches prepared statements for QuerySpendableTokens (and hence for
+	// SpendableTokensIteratorBy, which delegates to it). Keyed by the wider shape that query
+	// has: wallet and type presence as above, plus the amount bounds, the order and whether a
+	// limit applies. See #1919 and #2020.
 	spendableTokensStmts PreparedStmtHolder[string]
 
-	// balanceStmts caches prepared statements for balance, keyed the same
-	// way. balance() has a single caller (Balance()) that always sets only
-	// WalletID/TokenType, so unspentTokensStmtKey's shape encoding applies
-	// here too.
+	// balanceStmts caches prepared statements for balance, keyed by the shape of the
+	// QueryTokenDetailsParams balance renders: wallet and type presence as above, plus the
+	// amount bounds. See balanceStmtKey.
 	balanceStmts PreparedStmtHolder[string]
 }
 
-func newTokenStore(readDB, writeDB *sql.DB, tables tokenTables, ci common3.CondInterpreter, notifier driver.TokenNotifier, cleanupLeaderFactory func(context.Context, *sql.DB, int64) (driver.CleanupLeadership, bool, error)) *TokenStore {
+func newTokenStore(readDB *sql.DB, writeDB WriteDB, tables tokenTables, ci common3.CondInterpreter, notifier driver.TokenNotifier, cleanupLeaderFactory func(context.Context, WriteDB) (driver.CleanupLeadership, bool, error)) *TokenStore {
 	ts := &TokenStore{
 		readDB:               readDB,
 		writeDB:              writeDB,
@@ -84,7 +88,7 @@ func newTokenStore(readDB, writeDB *sql.DB, tables tokenTables, ci common3.CondI
 	return ts
 }
 
-func NewTokenStoreWithNotifier(readDB, writeDB *sql.DB, tables TableNames, ci common3.CondInterpreter, notifier driver.TokenNotifier) (*TokenStore, error) {
+func NewTokenStoreWithNotifier(readDB *sql.DB, writeDB WriteDB, tables TableNames, ci common3.CondInterpreter, notifier driver.TokenNotifier) (*TokenStore, error) {
 	return newTokenStore(readDB, writeDB, tokenTables{
 		Tokens:           tables.Tokens,
 		Ownership:        tables.Ownership,
@@ -92,15 +96,17 @@ func NewTokenStoreWithNotifier(readDB, writeDB *sql.DB, tables TableNames, ci co
 		Certifications:   tables.Certifications,
 		Requests:         tables.Requests,
 		TokenSKICleanups: tables.TokenSKICleanups,
+		TokenLocks:       tables.TokenLocks,
 	}, ci, notifier, nil), nil
 }
 
 func NewTokenStoreWithNotifierAndCleanup(
-	readDB, writeDB *sql.DB,
+	readDB *sql.DB,
+	writeDB WriteDB,
 	tables TableNames,
 	ci common3.CondInterpreter,
 	notifier driver.TokenNotifier,
-	cleanupLeaderFactory func(context.Context, *sql.DB, int64) (driver.CleanupLeadership, bool, error),
+	cleanupLeaderFactory func(context.Context, WriteDB) (driver.CleanupLeadership, bool, error),
 ) (*TokenStore, error) {
 	return newTokenStore(readDB, writeDB, tokenTables{
 		Tokens:           tables.Tokens,
@@ -109,6 +115,7 @@ func NewTokenStoreWithNotifierAndCleanup(
 		Certifications:   tables.Certifications,
 		Requests:         tables.Requests,
 		TokenSKICleanups: tables.TokenSKICleanups,
+		TokenLocks:       tables.TokenLocks,
 	}, ci, notifier, cleanupLeaderFactory), nil
 }
 
@@ -384,28 +391,160 @@ func (it *dedupedTokenRowsIterator) Next() (*token.UnspentToken, error) {
 	return nil, nil
 }
 
-// SpendableTokensIteratorBy returns the minimum information about the tokens needed for the selector
 // buildSpendableTokensIteratorByQuery builds the SQL query and args for
 // SpendableTokensIteratorBy without executing it. Extracted so benchmarks
 // can compare the dynamic path against a prepared-once path using identical
 // SQL (see #1919).
 func buildSpendableTokensIteratorByQuery(db *TokenStore, walletID string, typ token.Type) (string, []any) {
-	return q.Select().
-		FieldsByName("tx_id", "idx", "token_type", "quantity", "owner_wallet_id").
-		From(q.Table(db.table.Tokens)).
-		Where(HasTokenDetails(driver.QueryTokenDetailsParams{
-			WalletID:           walletID,
-			TokenType:          typ,
-			Spendable:          driver.SpendableOnly,
-			LedgerTokenFormats: db.getSupportedTokenFormats(),
-		}, nil)).
-		Format(db.ci)
+	return buildSpendableTokensQuery(db, spendableTokensIteratorByParams(walletID, typ))
 }
 
+// spendableTokensIteratorByParams is the SpendableTokensQuery that SpendableTokensIteratorBy
+// stands for, in one place so the iterator and buildSpendableTokensIteratorByQuery (and the
+// benchmark that compares them) cannot drift apart.
+//
+// Order is explicit rather than left at the zero value: AmountUnordered is the cheapest plan
+// in general, but sherdlock's candidate scan requires ascending-by-amount rows - its
+// bucketedIterator shuffle and its sufficiency window both assume every later candidate is
+// >= the current one (#2395, mechanism 2) - and the covering index supplies that order with
+// no sort step.
+func spendableTokensIteratorByParams(walletID string, typ token.Type) driver.SpendableTokensQuery {
+	return driver.SpendableTokensQuery{
+		WalletID:  walletID,
+		TokenType: typ,
+		Order:     driver.AmountAscending,
+	}
+}
+
+// buildSpendableTokensQuery builds the SQL query and args behind
+// QuerySpendableTokens.
+//
+// Tokens another consumer already holds a lock on are excluded here, in the shared builder,
+// and not only on the SpendableTokensIteratorBy path: QuerySpendableTokens is documented as
+// that iterator plus bounds, so a bounded caller must not start seeing candidates the
+// unbounded one hides (#2395, mechanism 1). See notLocked.
+//
+// The amount bounds, the order and the limit are all expressed in SQL rather than applied
+// after the fact, so a bounded window costs a bounded scan: with WalletID and TokenType set,
+// idx_spendable_amount covers the equality predicates, the amount range and the sort, and
+// the LIMIT stops the scan early instead of after the whole spendable set has been read and
+// re-parsed in Go (see #2020).
+func buildSpendableTokensQuery(db *TokenStore, params driver.SpendableTokensQuery) (string, []any) {
+	tokenTable := q.Table(db.table.Tokens)
+	tokenLocksTable := q.Table(db.table.TokenLocks)
+
+	query := q.Select().
+		FieldsByName("tx_id", "idx", "token_type", "quantity", "owner_wallet_id").
+		From(tokenTable).
+		Where(cond.And(
+			HasTokenDetails(driver.QueryTokenDetailsParams{
+				WalletID:           params.WalletID,
+				TokenType:          params.TokenType,
+				Spendable:          driver.SpendableOnly,
+				LedgerTokenFormats: db.getSupportedTokenFormats(),
+				MinAmount:          params.MinAmount,
+				MaxAmount:          params.MaxAmount,
+			}, nil),
+			notLocked(tokenTable, tokenLocksTable),
+		))
+
+	// Sort on amount alone. Adding tx_id/idx as tie-breakers would make the sequence stable
+	// but would also cost a sort step, since the covering index is ordered by amount only.
+	// An empty slice emits no ORDER BY at all, which is what AmountUnordered asks for.
+	var orderBys []common3.OrderBy
+	switch params.Order {
+	case driver.AmountAscending:
+		orderBys = []common3.OrderBy{q.Asc(common3.FieldName("amount"))}
+	case driver.AmountDescending:
+		orderBys = []common3.OrderBy{q.Desc(common3.FieldName("amount"))}
+	case driver.AmountUnordered:
+	}
+
+	// A non-positive Limit means "no cap", which the builder spells as 0. params.Limit cannot
+	// be forwarded unclamped: the builder reads common3.ZeroLimit (-1) as an explicit LIMIT 0,
+	// so a negative Limit would return nothing instead of everything.
+	limit := max(params.Limit, 0)
+
+	return query.OrderBy(orderBys...).Limit(limit).Format(db.ci)
+}
+
+// spendableTokensStmtKey returns the cache key for the argument shape of a
+// QuerySpendableTokens call. As in unspentTokensStmtKey, the generated SQL depends on which
+// fields are set and not on their values — the bounds and the limit are bound parameters — so
+// calls of the same shape share one prepared statement.
+//
+// The key is fixed-width, one byte per dimension, so that two shapes whose SQL differs cannot
+// spell the same key and be handed each other's cached statement.
+func spendableTokensStmtKey(params driver.SpendableTokensQuery) string {
+	key := []byte(unspentTokensStmtKey(params.WalletID, params.TokenType))
+	key = append(key,
+		setKeyByte(params.MinAmount != nil),
+		setKeyByte(params.MaxAmount != nil),
+		orderKeyByte(params.Order),
+		setKeyByte(params.Limit > 0),
+	)
+
+	return string(key)
+}
+
+// setKeyByte renders "this dimension is present" as a single byte of a shape key.
+func setKeyByte(set bool) byte {
+	if set {
+		return '1'
+	}
+
+	return '0'
+}
+
+// orderKeyByte renders an AmountOrder as a single byte of a shape key. An order the store
+// does not know keys as unordered, matching what buildSpendableTokensQuery emits for it.
+func orderKeyByte(order driver.AmountOrder) byte {
+	switch order {
+	case driver.AmountAscending:
+		return 'a'
+	case driver.AmountDescending:
+		return 'd'
+	case driver.AmountUnordered:
+	}
+
+	return 'u'
+}
+
+// notLocked excludes tokens that currently have a row in TokenLocks, so
+// concurrent selectors stop racing to lock a token they can already see is
+// held by someone else (#2395, mechanism 3). The row-level INSERT into
+// TokenLocks remains the race-safe backstop for the window between this read
+// and that INSERT; this anti-join only stops selectors from starting a race
+// they are very likely to lose.
+//
+// This is deliberately not folded into HasTokenDetails: balance and audit
+// queries need to see locked tokens too, only the spendable-tokens query
+// used by the selector should exclude them.
+func notLocked(tokenTable, tokenLocksTable common3.Table) cond.Condition {
+	return cond.NotExists(
+		q.Select().
+			Fields(common3.FieldName("1")).
+			From(tokenLocksTable).
+			Where(cond.And(
+				cond.Cmp(tokenLocksTable.Field("tx_id"), "=", tokenTable.Field("tx_id")),
+				cond.Cmp(tokenLocksTable.Field("idx"), "=", tokenTable.Field("idx")),
+			)),
+	)
+}
+
+// SpendableTokensIteratorBy returns the minimum information about the tokens needed for the
+// selector: every spendable token of the wallet and type that no other consumer currently
+// holds a lock on, ascending by amount and unlimited. Callers that need only part of that
+// set should use QuerySpendableTokens.
 func (db *TokenStore) SpendableTokensIteratorBy(ctx context.Context, walletID string, typ token.Type) (tdriver.SpendableTokensIterator, error) {
-	key := unspentTokensStmtKey(walletID, typ)
+	return db.QuerySpendableTokens(ctx, spendableTokensIteratorByParams(walletID, typ))
+}
+
+// QuerySpendableTokens returns an iterator over the spendable tokens matching params.
+func (db *TokenStore) QuerySpendableTokens(ctx context.Context, params driver.SpendableTokensQuery) (tdriver.SpendableTokensIterator, error) {
+	key := spendableTokensStmtKey(params)
 	rows, err := db.spendableTokensStmts.Execute(ctx, db.readDB, key, func() (string, []any, error) {
-		query, args := buildSpendableTokensIteratorByQuery(db, walletID, typ)
+		query, args := buildSpendableTokensQuery(db, params)
 
 		return query, args, nil
 	})
@@ -416,6 +555,54 @@ func (db *TokenStore) SpendableTokensIteratorBy(ctx context.Context, walletID st
 	return common.NewIterator(rows, func(r *token.UnspentTokenInWallet) error {
 		return rows.Scan(&r.Id.TxId, &r.Id.Index, &r.Type, &r.Quantity, &r.WalletID)
 	}), nil
+}
+
+// buildHasEnoughSpendableTokensQuery builds the SQL query and args for
+// HasEnoughSpendableTokens without executing it: the same spendable, lock-ignoring
+// predicate as buildSpendableTokensIteratorByQuery minus its notLocked anti-join, summing
+// amount so the wallet's total is computed in SQL rather than by fetching every token.
+func buildHasEnoughSpendableTokensQuery(db *TokenStore, walletID string, typ token.Type) (string, []any) {
+	return q.Select().FieldsByName("SUM(amount)").
+		From(q.Table(db.table.Tokens)).
+		Where(HasTokenDetails(driver.QueryTokenDetailsParams{
+			WalletID:           walletID,
+			TokenType:          typ,
+			Spendable:          driver.SpendableOnly,
+			LedgerTokenFormats: db.getSupportedTokenFormats(),
+		}, nil)).
+		Format(db.ci)
+}
+
+// HasEnoughSpendableTokens reports whether the wallet's total spendable balance of typ is
+// at least target. It deliberately ignores locks: the question it answers is "can this
+// wallet ever pay", not "can it pay right now". The selector uses it as a
+// fast fail, so that a wallet holding dust that could never cover the requested amount
+// fails immediately instead of burning the immediate-retry/backoff budget first.
+func (db *TokenStore) HasEnoughSpendableTokens(ctx context.Context, walletID string, typ token.Type, target *big.Int) (bool, error) {
+	query, args := buildHasEnoughSpendableTokensQuery(db, walletID, typ)
+
+	rows, err := db.readDB.QueryContext(ctx, query, args...)
+	if err != nil {
+		return false, errors.Wrapf(err, "error querying db")
+	}
+	defer Close(rows)
+
+	var sum BigInt
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return false, err
+		}
+
+		return false, nil
+	}
+	if err := rows.Scan(&sum); err != nil {
+		return false, err
+	}
+	if sum.Int == nil {
+		return false, nil
+	}
+
+	return sum.Cmp(target) >= 0, nil
 }
 
 // UnspentLedgerTokensIteratorBy returns an iterator over all unspent ledger tokens
@@ -485,8 +672,29 @@ func buildBalanceQuery(db *TokenStore, opts driver.QueryTokenDetailsParams) (str
 		Format(db.ci)
 }
 
+// balanceStmtKey returns the cache key for the argument shape of a balance call.
+//
+// buildBalanceQuery renders HasTokenDetails, whose SQL varies with more than wallet and type:
+// the amount bounds add predicates when present. The key therefore covers the bounds too,
+// otherwise a bounded and an unbounded call of the same wallet and type would share a
+// statement and one of them would run the other's SQL.
+//
+// Only the dimensions balance's callers can vary are encoded. HasTokenDetails also branches on
+// IDs, TransactionIDs, WalletIDs, OwnerType, LedgerTokenFormats, IncludeDeleted and Spendable,
+// and its SQL depends on the length of the list-valued ones, not merely their presence. No
+// caller sets any of those here; one that starts to must extend this key with them.
+func balanceStmtKey(opts driver.QueryTokenDetailsParams) string {
+	key := []byte(unspentTokensStmtKey(opts.WalletID, opts.TokenType))
+	key = append(key,
+		setKeyByte(opts.MinAmount != nil),
+		setKeyByte(opts.MaxAmount != nil),
+	)
+
+	return string(key)
+}
+
 func (db *TokenStore) balance(ctx context.Context, opts driver.QueryTokenDetailsParams) (*big.Int, error) {
-	key := unspentTokensStmtKey(opts.WalletID, opts.TokenType)
+	key := balanceStmtKey(opts)
 	rows, err := db.balanceStmts.Execute(ctx, db.readDB, key, func() (string, []any, error) {
 		query, args := buildBalanceQuery(db, opts)
 
@@ -861,7 +1069,7 @@ func (db *TokenStore) getLedgerToken(ctx context.Context, ids []*token.ID) ([][]
 	tokens := make([][]byte, len(ids))
 	for i, id := range ids {
 		if tok, ok := tokenMap[id.String()]; !ok || tok == nil {
-			return nil, errors.Errorf("token not found for key [%s]", id)
+			return nil, errors.Wrapf(tdriver.ErrTokenNotFound, "token not found for key [%s]", id)
 		} else if len(tok) == 0 {
 			return nil, errors.Errorf("empty token found for key [%s]", id)
 		} else {
@@ -1103,12 +1311,12 @@ func (db *TokenStore) WhoDeletedTokens(ctx context.Context, inputs ...*token.ID)
 		return nil, isSpent, err
 	}
 	if counter == 0 {
-		return nil, nil, errors.Errorf("token not found for key [%s:%d]", inputs[0].TxId, inputs[0].Index)
+		return nil, nil, errors.Wrapf(tdriver.ErrTokenNotFound, "token not found for key [%s:%d]", inputs[0].TxId, inputs[0].Index)
 	}
 	if counter != len(inputs) {
 		for j, f := range found {
 			if !f {
-				return nil, nil, errors.Errorf("token not found for key [%s:%d]", inputs[j].TxId, inputs[j].Index)
+				return nil, nil, errors.Wrapf(tdriver.ErrTokenNotFound, "token not found for key [%s:%d]", inputs[j].TxId, inputs[j].Index)
 			}
 		}
 		panic("programming error: should not reach this point")
@@ -1130,10 +1338,22 @@ func (db *TokenStore) TransactionExists(ctx context.Context, id string) (bool, e
 	return len(txID) > 0, err
 }
 
+// StorePublicParams stores the passed public parameters, keyed by their hash, if
+// they are not stored already.
+//
+// A read failure is propagated rather than swallowed: PublicParamsByHash
+// recomputes the hash of what it finds, so it is the one place where a row whose
+// raw and raw_hash columns disagree is detectable. Falling through to the INSERT
+// would turn that into an opaque primary-key violation and leave the operator
+// without the reason.
 func (db *TokenStore) StorePublicParams(ctx context.Context, raw []byte) error {
 	rawHash := utils.Hashable(raw).Raw()
 
-	if pps, err := db.PublicParamsByHash(ctx, rawHash); err == nil && len(pps) > 0 {
+	pps, err := db.PublicParamsByHash(ctx, rawHash)
+	if err != nil {
+		return errors.WithMessagef(err, "cannot store public parameters [%s]", logging.Base64(rawHash))
+	}
+	if len(pps) > 0 {
 		logger.DebugfContext(ctx, "public params [%s] already in the database", logging.Base64(rawHash))
 		// no need to update the public parameters
 
@@ -1143,11 +1363,14 @@ func (db *TokenStore) StorePublicParams(ctx context.Context, raw []byte) error {
 	query, args := q.InsertInto(db.table.PublicParams).
 		Fields("raw", "raw_hash", "stored_at").
 		Row(raw, rawHash, time.Now().UTC()).
+		OnConflictDoNothing().
 		Format()
 	logger.DebugfContext(ctx, query, fmt.Sprintf("store public parameters (%d bytes), hash [%s]", len(raw), logging.Base64(rawHash)))
-	_, err := db.writeDB.ExecContext(ctx, query, args...)
+	if _, err := db.writeDB.ExecContext(ctx, query, args...); err != nil {
+		return errors.Wrapf(err, "failed storing public parameters with hash [%s]", logging.Base64(rawHash))
+	}
 
-	return err
+	return nil
 }
 
 func (db *TokenStore) PublicParams(ctx context.Context) ([]byte, error) {
@@ -1161,6 +1384,39 @@ func (db *TokenStore) PublicParams(ctx context.Context) ([]byte, error) {
 	return common.QueryUniqueContext[[]byte](ctx, db.readDB, query, args...)
 }
 
+// PublicParamsHashes returns the hashes of every public parameters version stored so far,
+// most recently stored first. StorePublicParams never overwrites an existing row, so this is
+// the full history of public parameters this node has observed.
+func (db *TokenStore) PublicParamsHashes(ctx context.Context) ([]tdriver.PPHash, error) {
+	query, args := q.Select().
+		FieldsByName("raw_hash").
+		From(q.Table(db.table.PublicParams)).
+		OrderBy(q.Desc(common3.FieldName("stored_at"))).
+		Format(db.ci)
+
+	logging.Debug(logger, query, args)
+	rows, err := db.readDB.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, errors.Wrapf(err, "error querying db")
+	}
+	defer Close(rows)
+	if err := rows.Err(); err != nil {
+		return nil, errors.Wrapf(err, "error querying db")
+	}
+
+	it := common.NewIterator(rows, func(h *tdriver.PPHash) error { return rows.Scan(h) })
+
+	return iterators.ReadAllValues(it)
+}
+
+// PublicParamsByHash returns the public parameters whose hash matches the passed
+// one, or nil if none are stored under it.
+//
+// Verification: the returned parameters are hashed and compared against rawHash
+// — see integrity.CheckPublicParamsHash. Callers fetch by hash in order to
+// re-validate a transaction against the setup it was created under, so
+// parameters that do not hash to the requested hash are reported rather than
+// returned.
 func (db *TokenStore) PublicParamsByHash(ctx context.Context, rawHash tdriver.PPHash) ([]byte, error) {
 	query, args := q.Select().
 		FieldsByName("raw").
@@ -1168,7 +1424,17 @@ func (db *TokenStore) PublicParamsByHash(ctx context.Context, rawHash tdriver.PP
 		Where(cond.Eq("raw_hash", rawHash)).
 		Format(db.ci)
 
-	return common.QueryUniqueContext[[]byte](ctx, db.readDB, query, args...)
+	raw, err := common.QueryUniqueContext[[]byte](ctx, db.readDB, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	if err := integrity.CheckPublicParamsHash(rawHash, raw); err != nil {
+		logger.ErrorfContext(ctx, "refusing to return public parameters: %v", err)
+
+		return nil, err
+	}
+
+	return raw, nil
 }
 
 func (db *TokenStore) StoreCertifications(ctx context.Context, certifications map[*token.ID][]byte) error {
@@ -1359,12 +1625,12 @@ func (db *TokenStore) MarkTokenCleaned(ctx context.Context, txID string, index u
 // In distributed deployments (PostgreSQL), this uses advisory locks to ensure only one instance performs cleanup.
 // AcquireCleanupLeadership returns a leadership handle for cleanup sweeping.
 // When no leader factory is configured, leadership is granted locally.
-func (db *TokenStore) AcquireCleanupLeadership(ctx context.Context, lockID int64) (driver.CleanupLeadership, bool, error) {
+func (db *TokenStore) AcquireCleanupLeadership(ctx context.Context) (driver.CleanupLeadership, bool, error) {
 	if db.cleanupLeaderFactory == nil {
 		return noopCleanupLeadership{}, true, nil
 	}
 
-	return db.cleanupLeaderFactory(ctx, db.writeDB, lockID)
+	return db.cleanupLeaderFactory(ctx, db.writeDB)
 }
 
 // noopCleanupLeadership is a no-op implementation for non-distributed deployments
@@ -1421,6 +1687,14 @@ func (db *TokenStore) GetSchema() string {
 		CREATE INDEX IF NOT EXISTS idx_ski_cleanup_%s ON %s ( is_deleted, spent_at );
 		CREATE INDEX IF NOT EXISTS idx_owner_wallet_id_%s ON %s ( owner_wallet_id );
 		CREATE INDEX IF NOT EXISTS idx_owner_wallet_part_%s ON %s ( owner_wallet_id, token_type ) WHERE is_deleted = false AND owner = true;
+		-- Covers buildSpendableTokensIteratorByQuery (#2395 phase 4b) end to end: its
+		-- equality predicates form the leading columns and its ORDER BY amount is the
+		-- trailing one, so the selector's spendable-tokens scan reads rows already in
+		-- amount order instead of sorting the whole wallet. Separate from
+		-- idx_owner_wallet_part rather than an extra column on it, because that index
+		-- already exists in deployed schemas and CREATE INDEX IF NOT EXISTS would not
+		-- replace it under the same name.
+		CREATE INDEX IF NOT EXISTS idx_spendable_amount_%s ON %s ( owner_wallet_id, token_type, amount ) WHERE is_deleted = false AND owner = true AND spendable = true;
 		CREATE INDEX IF NOT EXISTS idx_issued_%s ON %s ( redeemed, token_type ) WHERE issuer = true;
 
 		-- Ownership
@@ -1468,11 +1742,18 @@ func (db *TokenStore) GetSchema() string {
 		db.table.Tokens, db.table.Tokens,
 		db.table.Tokens, db.table.Tokens,
 		db.table.Tokens, db.table.Tokens,
+		db.table.Tokens, db.table.Tokens,
 		db.table.Ownership, db.table.Tokens,
 		db.table.PublicParams, db.table.PublicParams, db.table.PublicParams,
 		db.table.Certifications, db.table.Tokens,
 		db.table.TokenSKICleanups, db.table.Tokens, db.table.TokenSKICleanups, db.table.TokenSKICleanups,
-	)
+	) +
+		// TokenLocks is created here too, idempotently and alongside
+		// TokenLockStore.GetSchema, because buildSpendableTokensIteratorByQuery's notLocked
+		// anti-join (#2395, mechanism 3) makes this table a hard dependency of the token
+		// store itself, not just of the locker. The definition is shared rather than
+		// repeated so the two emitters cannot drift apart - see tokenLocksSchema.
+		tokenLocksSchema(db.table.TokenLocks, db.table.Tokens)
 }
 
 func (db *TokenStore) Close() error {
@@ -1480,7 +1761,7 @@ func (db *TokenStore) Close() error {
 	_ = db.spendableTokensStmts.Close()
 	_ = db.balanceStmts.Close()
 
-	return common2.Close(db.readDB, db.writeDB)
+	return CloseRWDB(db.readDB, db.writeDB)
 }
 
 func (db *TokenStore) NewTokenDBTransaction() (driver.TokenStoreTransaction, error) {
@@ -1636,6 +1917,11 @@ func (t *TokenTransaction) StoreToken(ctx context.Context, tr driver.TokenRecord
 	if len(tr.OwnerWalletID) == 0 && len(owners) == 0 && tr.Owner {
 		return errors.Errorf("no owners specified [%s]", string(debug.Stack()))
 	}
+	// The amount column is NUMERIC(78, 0) NOT NULL: refuse a missing or over-range value
+	// rather than storing one that disagrees with the authoritative quantity column.
+	if err := validateTokenAmount(tr.Amount); err != nil {
+		return errors.WithMessagef(err, "invalid amount for token [%s:%d]", tr.TxID, tr.Index)
+	}
 
 	// Store token
 	query, args := q.InsertInto(t.table.Tokens).
@@ -1653,7 +1939,7 @@ func (t *TokenTransaction) StoreToken(ctx context.Context, tr driver.TokenRecord
 			tr.LedgerMetadata,
 			tr.Type,
 			tr.Quantity,
-			tr.Amount,
+			tr.Amount.String(),
 			time.Now().UTC(),
 			tr.Owner,
 			tr.Auditor,
@@ -1711,30 +1997,67 @@ func (t *TokenTransaction) SetSpendable(ctx context.Context, tokenID token.ID, s
 	return nil
 }
 
+// SetSpendableBySupportedTokenFormats reconciles the spendable flag of every
+// token against formats: tokens whose ledger type is supported become
+// spendable, all others become non-spendable.
+//
+// Both updates are conditional on the flag actually having to change, so a
+// reconciliation that agrees with the stored state writes no rows. Rewriting
+// the whole table unconditionally - as this used to do, by clearing every flag
+// before setting the supported ones - costs a full-table rewrite and the
+// attendant MVCC bloat on every call, however little has changed.
 func (t *TokenTransaction) SetSpendableBySupportedTokenFormats(ctx context.Context, formats []token.Format) error {
-	// first set all spendable flags to false
+	// Clear the flag on tokens whose format is no longer supported. With no
+	// supported format at all, that is every token still marked spendable: note
+	// that cond.In degrades to AlwaysTrue on an empty value list, so the
+	// unsupported set has to be spelled out rather than derived by negating it.
+	var unsupported cond.Condition = cond.Eq("spendable", true)
+	if len(formats) > 0 {
+		unsupported = cond.And(
+			cond.Eq("spendable", true),
+			// A NULL ledger type matches no supported format either, but SQL's
+			// NOT (NULL IN (...)) is NULL rather than true, so it needs its own
+			// branch to still be cleared.
+			cond.Or(
+				cond.Not(cond.In("ledger_type", formats...)),
+				cond.IsNil(common3.FieldName("ledger_type")),
+			),
+		)
+	}
 	query, args := q.Update(t.table.Tokens).
 		Set("spendable", false).
-		Format(t.ci)
-
-	logging.Debug(logger, query, args)
-	if _, err := t.tx.ExecContext(ctx, query, args...); err != nil {
-		return errors.Wrapf(err, "error setting spendable flag to false for all tokens")
-	}
-
-	// then set the spendable flags to true only for the supported token types
-	query, args = q.Update(t.table.Tokens).
-		Set("spendable", true).
-		Where(cond.In("ledger_type", formats...)).
+		Where(unsupported).
 		Format(t.ci)
 
 	logging.Debug(logger, query, args)
 	res, err := t.tx.ExecContext(ctx, query, args...)
 	if err != nil {
+		return errors.Wrapf(err, "error setting spendable flag to false for token types other than [%v]", formats)
+	}
+	if rows, err := res.RowsAffected(); err == nil {
+		logger.DebugfContext(ctx, "cleared spendable flag on [%d] rows", rows)
+	}
+
+	if len(formats) == 0 {
+		return nil
+	}
+
+	// Then set the flag on the supported formats that do not already have it.
+	query, args = q.Update(t.table.Tokens).
+		Set("spendable", true).
+		Where(cond.And(
+			cond.Eq("spendable", false),
+			cond.In("ledger_type", formats...),
+		)).
+		Format(t.ci)
+
+	logging.Debug(logger, query, args)
+	res, err = t.tx.ExecContext(ctx, query, args...)
+	if err != nil {
 		return errors.Wrapf(err, "error setting spendable flag to true for token types [%v]", formats)
-	} else {
-		rows, _ := res.RowsAffected()
-		logger.DebugfContext(ctx, "rows affected [%d]", rows)
+	}
+	if rows, err := res.RowsAffected(); err == nil {
+		logger.DebugfContext(ctx, "set spendable flag on [%d] rows", rows)
 	}
 
 	return nil
@@ -1753,8 +2076,7 @@ func tokenDBError(err error) error {
 		return nil
 	}
 	logger.Error(err)
-	e := strings.ToLower(err.Error())
-	if strings.Contains(e, "foreign key constraint") {
+	if isForeignKeyViolation(err) {
 		return driver.ErrTokenDoesNotExist
 	}
 

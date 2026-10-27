@@ -15,6 +15,9 @@ import (
 	"github.com/LFDT-Panurus/panurus/token"
 	"github.com/LFDT-Panurus/panurus/token/driver"
 	"github.com/LFDT-Panurus/panurus/token/driver/mock"
+	"github.com/LFDT-Panurus/panurus/token/services/identity"
+	"github.com/LFDT-Panurus/panurus/token/services/identity/boolpolicy"
+	"github.com/LFDT-Panurus/panurus/token/services/identity/multisig"
 	"github.com/LFDT-Panurus/panurus/token/services/ttx"
 	mock2 "github.com/LFDT-Panurus/panurus/token/services/ttx/dep/mock"
 	"github.com/LFDT-Panurus/panurus/token/services/ttx/dep/tokenapi"
@@ -35,6 +38,12 @@ type TestEndorseViewContextInput struct {
 	// endorsed-transaction message.  Used to simulate the case where the initiator
 	// goes silent after the responder has already signed.
 	SigRequestOnly bool
+	// IsMeErr makes the token IdentityProvider's IsMe return this error, simulating a
+	// storage failure while resolving ownership of a required signer (issue #2066).
+	IsMeErr error
+	// RequestIssuer is the issuer recorded in the token request's issue action.
+	// Defaults to "an_issuer".
+	RequestIssuer token.Identity
 }
 
 type TestEndorseViewContext struct {
@@ -54,6 +63,9 @@ func newTestEndorseViewContext(t *testing.T, input *TestEndorseViewContextInput)
 	if len(input.IssuerIdentity) == 0 {
 		input.IssuerIdentity = []byte("an_issuer")
 	}
+	if len(input.RequestIssuer) == 0 {
+		input.RequestIssuer = []byte("an_issuer")
+	}
 
 	session := &mock2.Session{}
 	ch := make(chan *view.Message, 2)
@@ -70,7 +82,13 @@ func newTestEndorseViewContext(t *testing.T, input *TestEndorseViewContextInput)
 	tms.IDReturns(tmsID)
 	tokenDes := &mock.Deserializer{}
 	tokenIP := &mock.IdentityProvider{}
-	tokenIP.IsMeReturns(true)
+	if input.IsMeErr != nil {
+		// On a storage failure the boolean is untrusted; extractRequiredSigners must
+		// propagate the error rather than reading it as "not a required signer".
+		tokenIP.IsMeReturns(false, input.IsMeErr)
+	} else {
+		tokenIP.IsMeReturns(true, nil)
+	}
 	tokenSigner := &mock.Signer{}
 	tokenSigner.SignReturns([]byte("a_token_sigma"), nil)
 	tokenIP.GetSignerReturns(tokenSigner, nil)
@@ -94,7 +112,7 @@ func newTestEndorseViewContext(t *testing.T, input *TestEndorseViewContextInput)
 			ActionID: 0,
 			IssueMetadata: &driver.IssueMetadata{
 				Issuer: driver.AuditableIdentity{
-					Identity: []byte("an_issuer"),
+					Identity: input.RequestIssuer,
 				},
 			},
 		},
@@ -205,15 +223,17 @@ func newTestEndorseViewContext(t *testing.T, input *TestEndorseViewContextInput)
 	return c
 }
 
+type endorseViewTestCase struct {
+	name          string
+	prepare       func() *TestEndorseViewContext
+	expectError   bool
+	errorContains string
+	expectErr     error
+	verify        func(*TestEndorseViewContext, any)
+}
+
 func TestEndorseView(t *testing.T) {
-	testCases := []struct {
-		name          string
-		prepare       func() *TestEndorseViewContext
-		expectError   bool
-		errorContains string
-		expectErr     error
-		verify        func(*TestEndorseViewContext, any)
-	}{
+	testCases := []endorseViewTestCase{
 		{
 			name: "transaction is nil",
 			prepare: func() *TestEndorseViewContext {
@@ -260,6 +280,53 @@ func TestEndorseView(t *testing.T) {
 			expectError:   true,
 			errorContains: "pineapple",
 			expectErr:     ttx.ErrStorage,
+			verify: func(ctx *TestEndorseViewContext, _ any) {
+				assert.Equal(t, 0, ctx.session.SendCallCount())
+			},
+		},
+		{
+			// Regression test for issue #2066: a storage failure while checking whether a
+			// required signer is "me" must abort endorsement, not be flattened into a
+			// confident "not me" that silently drops the signer from the required set.
+			name: "IsMe storage failure aborts endorsement",
+			prepare: func() *TestEndorseViewContext {
+				return newTestEndorseViewContext(t, &TestEndorseViewContextInput{
+					IsMeErr: errors.New("storage unavailable"),
+				})
+			},
+			expectError:   true,
+			errorContains: "failed checking if signer",
+			verify: func(ctx *TestEndorseViewContext, _ any) {
+				assert.Equal(t, 0, ctx.session.SendCallCount())
+			},
+		},
+		{
+			// Regression test for issue #2501: a signer typed as multisig whose body does not
+			// decode must abort endorsement instead of being handled as a plain signer.
+			name: "malformed multisig signer aborts endorsement",
+			prepare: func() *TestEndorseViewContext {
+				return newTestEndorseViewContext(t, &TestEndorseViewContextInput{
+					RequestIssuer: mustWrapWithType(t, multisig.Multisig, []byte("not a multi identity")),
+				})
+			},
+			expectError:   true,
+			errorContains: "failed unwrapping multi-sig identity",
+			expectErr:     ttx.ErrHandlingSignatureRequests,
+			verify: func(ctx *TestEndorseViewContext, _ any) {
+				assert.Equal(t, 0, ctx.session.SendCallCount())
+			},
+		},
+		{
+			// Same as above for a policy identity (issue #2501).
+			name: "malformed policy signer aborts endorsement",
+			prepare: func() *TestEndorseViewContext {
+				return newTestEndorseViewContext(t, &TestEndorseViewContextInput{
+					RequestIssuer: mustWrapWithType(t, boolpolicy.Policy, []byte("not a policy identity")),
+				})
+			},
+			expectError:   true,
+			errorContains: "failed unwrapping policy identity",
+			expectErr:     ttx.ErrHandlingSignatureRequests,
 			verify: func(ctx *TestEndorseViewContext, _ any) {
 				assert.Equal(t, 0, ctx.session.SendCallCount())
 			},
@@ -326,24 +393,31 @@ func TestEndorseView(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			testCtx := tc.prepare()
-			v := ttx.NewEndorseView(testCtx.tx)
-			txBoxed, err := v.Call(testCtx.ctx)
-			if tc.expectError {
-				require.Error(t, err)
-				if len(tc.errorContains) != 0 {
-					assert.Contains(t, err.Error(), tc.errorContains)
-				}
-				if tc.expectErr != nil {
-					require.ErrorIs(t, err, tc.expectErr)
-				}
-			} else {
-				require.NoError(t, err)
-				if tc.verify != nil {
-					tc.verify(testCtx, txBoxed)
-				}
-			}
+			runEndorseViewTestCase(t, tc)
 		})
+	}
+}
+
+func runEndorseViewTestCase(t *testing.T, tc endorseViewTestCase) {
+	t.Helper()
+	testCtx := tc.prepare()
+	v := ttx.NewEndorseView(testCtx.tx)
+	txBoxed, err := v.Call(testCtx.ctx)
+	if tc.expectError {
+		require.Error(t, err)
+		if len(tc.errorContains) != 0 {
+			assert.Contains(t, err.Error(), tc.errorContains)
+		}
+		if tc.expectErr != nil {
+			require.ErrorIs(t, err, tc.expectErr)
+		}
+
+		return
+	}
+
+	require.NoError(t, err)
+	if tc.verify != nil {
+		tc.verify(testCtx, txBoxed)
 	}
 }
 
@@ -394,4 +468,14 @@ func TestEndorseView_EndorsedTxContextCancellation(t *testing.T) {
 	// Phase 1 signature was sent before the context was cancelled.
 	assert.GreaterOrEqual(t, testCtx.session.SendCallCount(), 1,
 		"token signature must have been sent before context cancellation")
+}
+
+// mustWrapWithType wraps raw as a typed identity of the given type, without checking that raw is a
+// valid body for that type.
+func mustWrapWithType(t *testing.T, idType identity.Type, raw []byte) token.Identity {
+	t.Helper()
+	id, err := identity.WrapWithType(idType, raw)
+	require.NoError(t, err)
+
+	return id
 }

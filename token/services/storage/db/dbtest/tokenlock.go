@@ -7,6 +7,7 @@ SPDX-License-Identifier: Apache-2.0
 package dbtest
 
 import (
+	"math/big"
 	"testing"
 	"time"
 
@@ -14,7 +15,6 @@ import (
 	driver3 "github.com/LFDT-Panurus/panurus/token/services/storage/db/driver"
 	"github.com/LFDT-Panurus/panurus/token/services/utils"
 	"github.com/LFDT-Panurus/panurus/token/token"
-	fscerrors "github.com/hyperledger-labs/fabric-smart-client/pkg/utils/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -65,6 +65,11 @@ var tokenLockDBCases = []struct {
 	{"TestKeepSiblingIndices", TestKeepSiblingIndices},
 	{"TestReleaseOnAgedLease", TestReleaseOnAgedLease},
 	{"TestKeepFreshPendingLock", TestKeepFreshPendingLock},
+	{"TestListLocks", TestListLocks},
+	{"TestListLocksReportsLockAge", TestListLocksReportsLockAge},
+	{"TestReleaseAfterConfirm", TestReleaseAfterConfirm},
+	{"TestRejectSpentToken", TestRejectSpentToken},
+	{"TestRejectNonSpendableToken", TestRejectNonSpendableToken},
 }
 
 func TestFully(t *testing.T, tokenDB driver3.TokenStore, tokenLockDB driver3.TokenLockStore, tokenTransactionDB driver3.TokenTransactionStore) {
@@ -89,7 +94,7 @@ func TestFully(t *testing.T, tokenDB driver3.TokenStore, tokenLockDB driver3.Tok
 		LedgerMetadata: []byte{}, // Empty metadata
 		Quantity:       "0x64",   // 100 in hex
 		Type:           "USD",
-		Amount:         100,
+		Amount:         big.NewInt(100),
 		Owner:          true,
 	}
 	err = tokenTx.StoreToken(ctx, tokenRecord, []string{"owner1"})
@@ -223,6 +228,214 @@ func TestKeepFreshPendingLock(t *testing.T, tokenDB driver3.TokenStore, tokenLoc
 	requireLockHeld(t, tokenLockDB, tokenID)
 }
 
+// TestListLocks verifies that ListLocks reports every held lock together with the
+// current status of its consuming transaction, and that a released lock disappears
+// from the listing. This is the diagnostic reader added for #2395.
+func TestListLocks(t *testing.T, tokenDB driver3.TokenStore, tokenLockDB driver3.TokenLockStore, tokenTransactionDB driver3.TokenTransactionStore) {
+	ctx := t.Context()
+	held := token.ID{TxId: "producer", Index: 0}
+	toRelease := token.ID{TxId: "producer", Index: 1}
+	orphaned := token.ID{TxId: "producer", Index: 2}
+
+	addTokenRequest(t, tokenTransactionDB, "producer")
+	addTokenRequest(t, tokenTransactionDB, "pending-consumer")
+	addTokenRequest(t, tokenTransactionDB, "settled-consumer")
+	storeTokens(t, tokenDB, "producer", 0, 1, 2)
+	require.NoError(t, tokenLockDB.Lock(ctx, &held, "pending-consumer", "owner1"))
+	require.NoError(t, tokenLockDB.Lock(ctx, &toRelease, "settled-consumer", "owner1"))
+	// No token request is registered for "assembling-consumer": the selector takes
+	// the lock while the transfer is still being assembled, so a lock can legitimately
+	// precede its consumer's requests row. Only consumer_tx_id has no foreign key, so
+	// this shape is representable, and ListLocks LEFT JOINs requests to keep it
+	// visible - dropping it would hide exactly the in-flight and abandoned locks
+	// #2395 is about.
+	require.NoError(t, tokenLockDB.Lock(ctx, &orphaned, "assembling-consumer", "owner1"))
+
+	locks, err := tokenLockDB.ListLocks(ctx)
+	require.NoError(t, err)
+	require.Len(t, locks, 3)
+
+	byTokenID := map[token.ID]driver3.LockRecord{}
+	for _, l := range locks {
+		byTokenID[l.TokenID] = l
+	}
+
+	pending, ok := byTokenID[held]
+	require.True(t, ok, "lock on %s should be reported", held)
+	require.Equal(t, "pending-consumer", pending.ConsumerTxID)
+	require.NotNil(t, pending.Status)
+	require.Equal(t, driver3.Pending, *pending.Status)
+
+	// A lock whose consumer has no requests row is reported with a nil Status,
+	// which is the documented contract of driver.LockRecord.Status.
+	orphan, ok := byTokenID[orphaned]
+	require.True(t, ok, "lock on %s should be reported even with no consumer requests row", orphaned)
+	require.Equal(t, "assembling-consumer", orphan.ConsumerTxID)
+	require.Nil(t, orphan.Status, "consumer has no requests row, so status must be nil")
+
+	// Mark the second consumer settled: the lock is still held (this is the leak
+	// TestListLocks is meant to surface - see mechanism 4 in #2395), and ListLocks
+	// must show its consumer's terminal status rather than silently dropping it.
+	require.NoError(t, tokenTransactionDB.SetStatus(ctx, "settled-consumer", driver3.Confirmed, ""))
+
+	locks, err = tokenLockDB.ListLocks(ctx)
+	require.NoError(t, err)
+	require.Len(t, locks, 3)
+	byTokenID = map[token.ID]driver3.LockRecord{}
+	for _, l := range locks {
+		byTokenID[l.TokenID] = l
+	}
+	settled, ok := byTokenID[toRelease]
+	require.True(t, ok, "lock on %s should still be reported after its consumer settles", toRelease)
+	require.NotNil(t, settled.Status)
+	require.Equal(t, driver3.Confirmed, *settled.Status)
+
+	// Releasing the lock removes it from the listing.
+	require.NoError(t, tokenLockDB.UnlockByTxID(ctx, "settled-consumer"))
+	locks, err = tokenLockDB.ListLocks(ctx)
+	require.NoError(t, err)
+	require.Len(t, locks, 2)
+	require.NotContains(t, collectTokenIDs(locks), toRelease)
+}
+
+// collectTokenIDs returns the token IDs of the given lock records.
+func collectTokenIDs(locks []driver3.LockRecord) []token.ID {
+	ids := make([]token.ID, 0, len(locks))
+	for _, l := range locks {
+		ids = append(ids, l.TokenID)
+	}
+
+	return ids
+}
+
+// TestListLocksReportsLockAge verifies that ListLocks round-trips the lock's creation
+// timestamp accurately, including across the sqlite/Postgres TIMESTAMPTZ divergence
+// that scannableTime handles (see #2395 Phase 1). LockRecord.CreatedAt is the field
+// the stress report's "how long has this token been contested" question turns on, so a
+// silent truncation or timezone shift here would make lock-age reporting unreliable
+// without ever failing ListLocks itself.
+func TestListLocksReportsLockAge(t *testing.T, tokenDB driver3.TokenStore, tokenLockDB driver3.TokenLockStore, tokenTransactionDB driver3.TokenTransactionStore) {
+	ctx := t.Context()
+	tokenID := token.ID{TxId: "producer", Index: 0}
+	const backdateBy = 90 * time.Second
+
+	addTokenRequest(t, tokenTransactionDB, "producer")
+	addTokenRequest(t, tokenTransactionDB, "consumer")
+	storeTokens(t, tokenDB, "producer", 0)
+
+	before := time.Now()
+	require.NoError(t, tokenLockDB.LockAt(ctx, &tokenID, "consumer", "owner1", before.Add(-backdateBy)))
+
+	locks, err := tokenLockDB.ListLocks(ctx)
+	require.NoError(t, err)
+	rec := requireLockRecord(t, locks, tokenID)
+
+	age := time.Since(rec.CreatedAt)
+	// Generous tolerance: only guards against a truncation/timezone bug, not clock
+	// skew or test scheduling jitter.
+	require.InDelta(t, backdateBy.Seconds(), age.Seconds(), 30,
+		"reported lock age %s should be close to the %s it was backdated by", age, backdateBy)
+}
+
+// TestReleaseAfterConfirm reproduces, at the store level, the literal
+// invariant the stress report flagged for token f8a27fc4...: once a lock's consuming
+// transaction reaches a terminal status and the lock has been released (as the
+// settlement path added in Phase 5 now does via UnlockByTxID), ListLocks must not go
+// on reporting it - regardless of how old the lock was when it was released. This
+// pins the release-then-verify round trip that the higher-level contention harness
+// (see testutils.TestHotTokenContentionWithSettlement) exercises under load.
+func TestReleaseAfterConfirm(t *testing.T, tokenDB driver3.TokenStore, tokenLockDB driver3.TokenLockStore, tokenTransactionDB driver3.TokenTransactionStore) {
+	ctx := t.Context()
+	tokenID := token.ID{TxId: "producer", Index: 0}
+
+	addTokenRequest(t, tokenTransactionDB, "producer")
+	addTokenRequest(t, tokenTransactionDB, "consumer")
+	storeTokens(t, tokenDB, "producer", 0)
+
+	// Backdate well past what any sane lease/cleanup tick would use, so this can only
+	// pass because of an explicit release, never because of age-based Cleanup.
+	require.NoError(t, tokenLockDB.LockAt(ctx, &tokenID, "consumer", "owner1", time.Now().Add(-10*time.Minute)))
+	require.NoError(t, tokenTransactionDB.SetStatus(ctx, "consumer", driver3.Confirmed, ""))
+
+	// Before release, the lock is exactly the leak the stress report flagged: an old
+	// lock whose consumer has already reached a terminal status.
+	locks, err := tokenLockDB.ListLocks(ctx)
+	require.NoError(t, err)
+	rec := requireLockRecord(t, locks, tokenID)
+	require.True(t, driver3.IsTerminalStatus(rec.Status), "consumer status should be terminal")
+
+	// The release path (finality.Listener/TTXRecoveryHandler) calls UnlockByTxID on
+	// settlement; simulate it here, and require the leak to be gone.
+	require.NoError(t, tokenLockDB.UnlockByTxID(ctx, "consumer"))
+	requireNoLeakedLocks(t, tokenLockDB)
+	requireLockReleased(t, tokenLockDB, tokenID)
+}
+
+// TestRejectSpentToken verifies that a lock cannot be acquired on a token that has been
+// spent since the caller last read it. The foreign key on (tx_id, idx) is not enough on
+// its own: spending soft-deletes the token, leaving the row in place, so without the
+// spendability predicate the lock succeeds and the selector returns a candidate its caller
+// cannot load ("token not found for key ..."). The two failure modes must stay
+// distinguishable - contention is worth retrying, a spent candidate never is - so this
+// also pins the error to ErrTokenNotSpendable rather than ErrTokenAlreadyLocked. See #2395.
+func TestRejectSpentToken(t *testing.T, tokenDB driver3.TokenStore, tokenLockDB driver3.TokenLockStore, tokenTransactionDB driver3.TokenTransactionStore) {
+	ctx := t.Context()
+	tokenID := token.ID{TxId: "producer", Index: 0}
+
+	addTokenRequest(t, tokenTransactionDB, "producer")
+	storeTokens(t, tokenDB, "producer", 0)
+
+	// While spendable, the lock is acquired and then released, so the only thing that
+	// differs below is the token's own state, not a leftover lock row.
+	require.NoError(t, tokenLockDB.Lock(ctx, &tokenID, "consumer", "owner1"))
+	require.NoError(t, tokenLockDB.UnlockByTxID(ctx, "consumer"))
+
+	require.NoError(t, tokenDB.DeleteTokens(ctx, "spender", &tokenID))
+
+	err := tokenLockDB.Lock(ctx, &tokenID, "late-consumer", "owner1")
+	require.ErrorIs(t, err, driver3.ErrTokenNotSpendable)
+	require.NotErrorIs(t, err, driver3.ErrTokenAlreadyLocked,
+		"a spent token is a stale candidate, not contention")
+	requireLockReleased(t, tokenLockDB, tokenID)
+}
+
+// TestRejectNonSpendableToken is TestRejectSpentToken's sibling for the other way a token
+// stops being a valid candidate: it is still present and undeleted, but has been marked
+// non-spendable (e.g. its ledger format is no longer supported). The spendable-tokens query
+// the selector reads from excludes it, so a lock must refuse it for the same reason.
+func TestRejectNonSpendableToken(t *testing.T, tokenDB driver3.TokenStore, tokenLockDB driver3.TokenLockStore, tokenTransactionDB driver3.TokenTransactionStore) {
+	ctx := t.Context()
+	tokenID := token.ID{TxId: "producer", Index: 0}
+
+	addTokenRequest(t, tokenTransactionDB, "producer")
+	storeTokens(t, tokenDB, "producer", 0)
+	setSpendable(t, tokenDB, tokenID, false)
+
+	require.ErrorIs(t,
+		tokenLockDB.Lock(ctx, &tokenID, "consumer", "owner1"),
+		driver3.ErrTokenNotSpendable,
+	)
+	requireLockReleased(t, tokenLockDB, tokenID)
+
+	// Made spendable again, the very same token locks normally: the refusal tracks the
+	// token's current state, it is not a permanent mark on the (tx_id, idx) pair.
+	setSpendable(t, tokenDB, tokenID, true)
+	require.NoError(t, tokenLockDB.Lock(ctx, &tokenID, "consumer", "owner1"))
+	requireLockHeld(t, tokenLockDB, tokenID)
+}
+
+// setSpendable flips the spendable flag of tokenID. SetSpendable lives on the token store's
+// transaction rather than on the store itself, so it is wrapped here to keep the tests above
+// readable.
+func setSpendable(t *testing.T, tokenDB driver3.TokenStore, tokenID token.ID, spendable bool) {
+	t.Helper()
+
+	tx, err := tokenDB.NewTokenDBTransaction()
+	require.NoError(t, err)
+	require.NoError(t, tx.SetSpendable(t.Context(), tokenID, spendable))
+	require.NoError(t, tx.Commit())
+}
+
 // addTokenRequest registers a token request for txID, so that its status can later be
 // moved to a terminal one with SetStatus.
 func addTokenRequest(t *testing.T, tokenTransactionDB driver3.TokenTransactionStore, txID string) {
@@ -252,25 +465,20 @@ func storeTokens(t *testing.T, tokenDB driver3.TokenStore, txID string, indices 
 			LedgerMetadata: []byte{},
 			Quantity:       "0x64",
 			Type:           "USD",
-			Amount:         100,
+			Amount:         big.NewInt(0x64),
 			Owner:          true,
 		}, []string{"owner1"}))
 	}
 	require.NoError(t, tx.Commit())
 }
 
-// requireLockHeld asserts that the lock on tokenID survived cleanup. The store exposes
-// no read API, so the probe is a second Lock on the same token: the (tx_id, idx)
-// primary key rejects it for as long as the row is there.
-// We assert on driver3.ErrTokenAlreadyLocked specifically so that an unrelated Lock
-// failure (e.g. a future rule that rejects locks on Deleted producers) does not make
-// "Keep" tests pass vacuously.
+// requireLockHeld asserts that the lock on tokenID survived cleanup, via
+// TokenLockStore.ListLocks (see #2395) rather than probing with a second Lock call.
 func requireLockHeld(t *testing.T, tokenLockDB driver3.TokenLockStore, tokenID token.ID) {
 	t.Helper()
 
-	err := tokenLockDB.Lock(t.Context(), &tokenID, "probe-"+tokenID.String(), "owner1")
-	require.True(t, fscerrors.Is(err, driver3.ErrTokenAlreadyLocked),
-		"lock on token %s should still be held (want ErrTokenAlreadyLocked, got %v)", tokenID, err)
+	require.True(t, lockExists(t, tokenLockDB, tokenID),
+		"lock on token %s should still be held", tokenID)
 }
 
 // requireLockReleased asserts that cleanup collected the lock on tokenID: the row is
@@ -278,6 +486,51 @@ func requireLockHeld(t *testing.T, tokenLockDB driver3.TokenLockStore, tokenID t
 func requireLockReleased(t *testing.T, tokenLockDB driver3.TokenLockStore, tokenID token.ID) {
 	t.Helper()
 
-	require.NoError(t, tokenLockDB.Lock(t.Context(), &tokenID, "probe-"+tokenID.String(), "owner1"),
+	require.False(t, lockExists(t, tokenLockDB, tokenID),
 		"lock on token %s should have been released", tokenID)
+}
+
+// lockExists reports whether tokenID appears among the currently held locks.
+func lockExists(t *testing.T, tokenLockDB driver3.TokenLockStore, tokenID token.ID) bool {
+	t.Helper()
+
+	locks, err := tokenLockDB.ListLocks(t.Context())
+	require.NoError(t, err)
+	for _, l := range locks {
+		if l.TokenID == tokenID {
+			return true
+		}
+	}
+
+	return false
+}
+
+// requireLockRecord finds tokenID among locks or fails the test.
+func requireLockRecord(t *testing.T, locks []driver3.LockRecord, tokenID token.ID) driver3.LockRecord {
+	t.Helper()
+
+	for _, l := range locks {
+		if l.TokenID == tokenID {
+			return l
+		}
+	}
+	t.Fatalf("lock on token %s not found among %d reported locks", tokenID, len(locks))
+
+	return driver3.LockRecord{}
+}
+
+// requireNoLeakedLocks asserts that no currently held lock has a consumer that has
+// already reached a terminal status - i.e. that ListLocks agrees with
+// driver3.IsTerminalStatus that nothing is leaked. This is the literal invariant
+// the stress report's ">6 minutes after SETTLED" observation flagged for #2395.
+func requireNoLeakedLocks(t *testing.T, tokenLockDB driver3.TokenLockStore) {
+	t.Helper()
+
+	locks, err := tokenLockDB.ListLocks(t.Context())
+	require.NoError(t, err)
+	for _, l := range locks {
+		require.False(t, driver3.IsTerminalStatus(l.Status),
+			"lock on token %s should have been released: consumer %s is already terminal",
+			l.TokenID, l.ConsumerTxID)
+	}
 }

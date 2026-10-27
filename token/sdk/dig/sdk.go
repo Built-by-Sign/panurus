@@ -43,6 +43,7 @@ import (
 	"github.com/LFDT-Panurus/panurus/token/services/storage/endorserdb"
 	"github.com/LFDT-Panurus/panurus/token/services/storage/identitydb"
 	"github.com/LFDT-Panurus/panurus/token/services/storage/keystoredb"
+	"github.com/LFDT-Panurus/panurus/token/services/storage/services/checks"
 	"github.com/LFDT-Panurus/panurus/token/services/storage/services/cleanup"
 	"github.com/LFDT-Panurus/panurus/token/services/storage/tokendb"
 	"github.com/LFDT-Panurus/panurus/token/services/storage/tokenlockdb"
@@ -115,7 +116,7 @@ func (p *SDK) Install() error {
 		p.Container().Provide(ftsconfig.NewService),
 		p.Container().Provide(
 			digutils.Identity[*ftsconfig.Service](),
-			dig.As(new(cleanup.Configuration)),
+			dig.As(new(cleanup.Configuration), new(checks.Configuration)),
 		),
 		p.Container().Provide(tms.NewConfigServiceWrapper),
 		p.Container().Provide(
@@ -166,16 +167,19 @@ func (p *SDK) Install() error {
 		),
 
 		// selector service
-		p.Container().Provide(func(tokenStoreServiceManager tokendb.StoreServiceManager, metricsProvider metrics.Provider, cp sherdlock.ConfigProvider) sherdlock.FetcherProvider {
+		p.Container().Provide(func(tokenStoreServiceManager tokendb.StoreServiceManager, metricsProvider metrics.Provider, cp sherdlock.ConfigProvider) (sherdlock.FetcherProvider, error) {
 			cfg, err := config.New(cp)
 			if err != nil {
 				logger.Errorf("error getting selector config for fetcher, using defaults. %s", err.Error())
+				cfg = &config.Config{}
 			}
 
+			// An unrecognized token.selector.fetcherStrategy fails the container installation
+			// rather than the process, the same way an unknown token.selector.driver does.
 			return sherdlock.NewFetcherProvider(
 				tokenStoreServiceManager,
 				metricsProvider,
-				sherdlock.Mixed,
+				sherdlock.FetcherStrategy(cfg.GetFetcherStrategy()),
 				cfg.GetFetcherCacheSize(),
 				cfg.GetFetcherCacheRefresh(),
 				cfg.GetFetcherCacheMaxQueries(),
@@ -202,6 +206,7 @@ func (p *SDK) Install() error {
 		p.Container().Provide(postgres.NewNamedDriver, dig.Group("token-db-drivers")),
 		p.Container().Provide(memory.NewNamedDriver, dig.Group("token-db-drivers")),
 		p.Container().Provide(newMultiplexedDriver),
+		p.Container().Provide(newStoragePolicy),
 		p.Container().Provide(NewAuditorCheckServiceProvider),
 		p.Container().Provide(digutils.Identity[*db.AuditorCheckServiceProvider](), dig.As(new(auditor.CheckServiceProvider))),
 		p.Container().Provide(NewOwnerCheckServiceProvider),
@@ -314,6 +319,30 @@ func (p *SDK) Start(ctx context.Context) error {
 	logger.Infof("Token platform enabled, starting...done")
 
 	return nil
+}
+
+// Stop stops the token platform services, including the background ledger
+// drift checks sweeps started as a side effect of building each TMS's check
+// service in Start, before stopping the underlying SDK.
+//
+// Without this, a running sweep - and on Postgres its dedicated advisory-lock
+// connection - outlives an in-process SDK restart: the old sweep keeps
+// holding the lock and the new one never acquires leadership.
+func (p *SDK) Stop() error {
+	if !p.TokenEnabled() {
+		return p.SDK.Stop()
+	}
+
+	var stopErrs []error
+	if err := p.Container().Invoke(func(a *db.AuditorCheckServiceProvider, o *db.OwnerCheckServiceProvider) error {
+		return errors.Join(a.Stop(), o.Stop())
+	}); err != nil {
+		stopErrs = append(stopErrs, errors.WithMessagef(err, "failed stopping the drift checks sweeps"))
+	}
+
+	stopErrs = append(stopErrs, p.SDK.Stop())
+
+	return errors.Join(stopErrs...)
 }
 
 // connectNetworks establishes connections to all configured networks.

@@ -21,11 +21,10 @@ import (
 	"github.com/hyperledger-labs/fabric-smart-client/integration/nwo/fsc"
 	"github.com/hyperledger-labs/fabric-smart-client/pkg/utils/errors"
 	"github.com/hyperledger-labs/fabric-smart-client/platform/common/driver"
+	"github.com/hyperledger-labs/fabric-smart-client/platform/common/services/grpc"
 	"github.com/hyperledger-labs/fabric-smart-client/platform/view/services/config"
-	"github.com/hyperledger-labs/fabric-smart-client/platform/view/services/grpc"
 	"github.com/hyperledger-labs/fabric-smart-client/platform/view/services/tracing"
-	grpcclient "github.com/hyperledger-labs/fabric-smart-client/platform/view/services/view/grpc/client"
-	webclient "github.com/hyperledger-labs/fabric-smart-client/platform/view/services/web/client"
+	viewclient "github.com/hyperledger-labs/fabric-smart-client/platform/view/services/view/client"
 	view2 "github.com/hyperledger-labs/fabric-smart-client/platform/view/view"
 	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
@@ -104,9 +103,9 @@ func newClient(corePath string, host string, connType ConnectionType) (driver.Co
 	}
 	var cli api2.ViewClient
 	if connType == REST {
-		cli, err = newWebClient(cfg, host)
+		cli, err = newViewClient(cfg, host, "fsc.web.address", viewclient.TransportHTTP)
 	} else {
-		cli, err = newGrpcClient(cfg, host)
+		cli, err = newViewClient(cfg, host, "fsc.grpc.address", viewclient.TransportGRPC)
 	}
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "failed to create view client")
@@ -115,41 +114,38 @@ func newClient(corePath string, host string, connType ConnectionType) (driver.Co
 	return cfg, cli, nil
 }
 
-func newGrpcClient(configProvider driver.ConfigService, host string) (api2.ViewClient, error) {
-	_, port, err := net.SplitHostPort(configProvider.GetString("fsc.grpc.address"))
+func newViewClient(configProvider driver.ConfigService, host string, addressKey string, transport viewclient.TransportType) (api2.ViewClient, error) {
+	_, port, err := net.SplitHostPort(configProvider.GetString(addressKey))
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to parse address")
 	}
 
-	cc := &grpc.ConnectionConfig{
-		Address:           fmt.Sprintf("%s:%s", host, port),
-		TLSEnabled:        true,
-		TLSRootCertFile:   configProvider.GetStringSlice("fsc.web.tls.clientRootCAs.files")[0],
-		ConnectionTimeout: 10 * time.Second,
+	rootCAFiles := configProvider.GetStringSlice("fsc.web.tls.clientRootCAs.files")
+	if len(rootCAFiles) == 0 {
+		return nil, errors.New("no TLS root CA files configured under fsc.web.tls.clientRootCAs.files")
+	}
+	rootCert, err := os.ReadFile(rootCAFiles[0])
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to read TLS root cert")
 	}
 
-	signer, err := grpcclient.NewX509SigningIdentity(
+	cc := &grpc.ConnectionConfig{
+		Address:           fmt.Sprintf("%s:%s", host, port),
+		ConnectionTimeout: 10 * time.Second,
+		TLS: grpc.SecureOptions{
+			UseTLS:        true,
+			ServerRootCAs: [][]byte{rootCert},
+		},
+	}
+
+	signer, err := viewclient.NewX509SigningIdentity(
 		configProvider.GetPath("fsc.identity.cert.file"),
 		configProvider.GetPath("fsc.identity.key.file"))
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to create signing identity")
 	}
 
-	return grpcclient.NewClient(&grpcclient.Config{ConnectionConfig: cc}, signer, noop.NewTracerProvider())
-}
-
-func newWebClient(configProvider driver.ConfigService, host string) (api2.ViewClient, error) {
-	_, port, err := net.SplitHostPort(configProvider.GetString("fsc.web.address"))
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to parse address")
-	}
-
-	return webclient.NewClient(&webclient.Config{
-		Host:        fmt.Sprintf("%s:%s", host, port),
-		CACertPath:  configProvider.GetStringSlice("fsc.web.tls.clientRootCAs.files")[0],
-		TLSCertPath: configProvider.GetPath("fsc.web.tls.cert.file"),
-		TLSKeyPath:  configProvider.GetPath("fsc.web.tls.key.file"),
-	})
+	return viewclient.NewClient(&viewclient.Config{ConnectionConfig: cc, Transport: transport}, signer, noop.NewTracerProvider())
 }
 
 type resolver struct {

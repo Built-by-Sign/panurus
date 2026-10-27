@@ -17,6 +17,7 @@ import (
 	"github.com/LFDT-Panurus/panurus/token/services/storage/db/common"
 	dbdriver "github.com/LFDT-Panurus/panurus/token/services/storage/db/driver"
 	"github.com/LFDT-Panurus/panurus/token/services/storage/db/multiplexed"
+	"github.com/LFDT-Panurus/panurus/token/services/storage/integrity"
 	"github.com/hyperledger-labs/fabric-smart-client/pkg/utils/errors"
 )
 
@@ -118,9 +119,31 @@ func (d *StoreService) ValidationRecords(ctx context.Context, params QueryValida
 	return &ValidationRecordsIterator{it: it}, nil
 }
 
-// AppendValidationRecord appends the given validation metadata related to the given transaction id
+// AppendValidationRecord appends the given validation metadata related to the given transaction id.
+//
+// Verification: tokenRequest is expected to have been validated against the
+// ledger by the caller — this store holds it as the validated request for txID,
+// and nothing downstream re-validates it. What is enforced here is that the
+// payload is a token request at all: it must deserialize as a
+// driver.TokenRequest of a supported protocol version and carry at least one
+// action, which are the conditions a validator rejects on before it looks at
+// any action. A payload reaching this store on a path that skipped validation
+// is therefore refused rather than filed as validated. An empty public
+// parameters hash is refused for the same reason it is refused by the ttx and
+// audit stores: it disables the public-parameters-mismatch check instead of
+// failing it.
+//
+// Note that this format carries no anchor, so the record cannot be bound to
+// txID by a structural check — see docs/security/store_integrity_verification.md.
 func (d *StoreService) AppendValidationRecord(ctx context.Context, txID string, tokenRequest []byte, meta map[string][]byte, ppHash driver2.PPHash) error {
 	logger.DebugfContext(ctx, "appending new validation record... [%s]", txID)
+
+	if err := integrity.CheckTokenRequestForStorage(txID, tokenRequest, ppHash); err != nil {
+		return errors.WithMessagef(err, "refusing to append validation record for txid [%s]", txID)
+	}
+	if err := integrity.CheckTokenRequestActions(tokenRequest); err != nil {
+		return errors.WithMessagef(err, "refusing to append validation record for txid [%s]", txID)
+	}
 
 	w, err := d.db.NewEndorserStoreTransaction()
 	if err != nil {
@@ -158,9 +181,14 @@ func (d *StoreService) SetStatus(ctx context.Context, txID string, status dbdriv
 		return errors.Wrapf(err, "failed committing status [%s][%s]", txID, dbdriver.TxStatusMessage[status])
 	}
 
-	// notify the listeners
+	// notify the listeners with a context detached from ctx's cancellation: by
+	// this point the status is already durably written, and safeSend only uses
+	// the context to give up on a stuck listener. Keeping ctx as-is would let a
+	// caller-side deadline that has nothing to do with the listener silently
+	// drop a notification for a status change that did succeed, the same bug
+	// fixed for ttxdb and auditdb. See issue #2316.
 	d.Notify(common.StatusEvent{
-		Ctx:            ctx,
+		Ctx:            context.WithoutCancel(ctx),
 		TxID:           txID,
 		ValidationCode: status,
 	})

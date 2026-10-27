@@ -7,17 +7,21 @@ SPDX-License-Identifier: Apache-2.0
 package ttxdb
 
 import (
+	"cmp"
 	"context"
 	"math/big"
 	"reflect"
+	"slices"
 	"time"
 
 	"github.com/LFDT-Panurus/panurus/token"
+	"github.com/LFDT-Panurus/panurus/token/driver/protos-go/v1/request"
 	"github.com/LFDT-Panurus/panurus/token/services/logging"
 	"github.com/LFDT-Panurus/panurus/token/services/storage/db"
 	"github.com/LFDT-Panurus/panurus/token/services/storage/db/common"
 	dbdriver "github.com/LFDT-Panurus/panurus/token/services/storage/db/driver"
 	"github.com/LFDT-Panurus/panurus/token/services/storage/db/multiplexed"
+	"github.com/LFDT-Panurus/panurus/token/services/storage/integrity"
 	"github.com/hyperledger-labs/fabric-smart-client/pkg/utils/errors"
 	cdriver "github.com/hyperledger-labs/fabric-smart-client/platform/common/driver"
 )
@@ -209,18 +213,22 @@ func (d *StoreService) AppendTransactionRecord(ctx context.Context, req *token.R
 	}
 
 	logger.DebugfContext(ctx, "storing new records... [%d,%d]", len(raw), len(txs))
+	anchor := string(record.Anchor)
+	ppHash := req.PublicParamsHash()
+	if err := integrity.CheckTokenRequestForStorage(anchor, raw, ppHash); err != nil {
+		return errors.WithMessagef(err, "refusing to append transaction record for txid [%s]", record.Anchor)
+	}
 	w, err := d.db.NewTransactionStoreTransaction()
 	if err != nil {
 		return errors.WithMessagef(err, "begin update for txid [%s] failed", record.Anchor)
 	}
-	anchor := string(record.Anchor)
 	if err := w.AddTokenRequest(
 		ctx,
 		anchor,
 		raw,
 		req.AllApplicationMetadata(),
 		record.Attributes,
-		req.PublicParamsHash(),
+		ppHash,
 	); err != nil {
 		w.Rollback()
 
@@ -259,8 +267,16 @@ func (d *StoreService) SetStatus(ctx context.Context, txID string, status dbdriv
 // NotifyStatus pushes a status event to the in-process listeners without
 // touching the database. Used after a transaction-scoped status update,
 // which bypasses SetStatus.
+//
+// The event carries a context detached from ctx's cancellation: by the time
+// this runs, the status is already durably written, and safeSend only uses
+// the context to give up on a stuck listener. Keeping ctx as-is would let a
+// caller-side deadline that has nothing to do with the listener (for example
+// a recovery attempt's per-transaction timeout, expiring right after its
+// write commits) silently drop a notification for a status change that did
+// succeed. See issue #2316.
 func (d *StoreService) NotifyStatus(ctx context.Context, txID string, status dbdriver.TxStatus, message string) {
-	d.Notify(common.StatusEvent{Ctx: ctx, TxID: txID, ValidationCode: status, ValidationMessage: message})
+	d.Notify(common.StatusEvent{Ctx: context.WithoutCancel(ctx), TxID: txID, ValidationCode: status, ValidationMessage: message})
 }
 
 // GetStatus return the status of the given transaction id.
@@ -284,32 +300,168 @@ func (d *StoreService) GetStatuses(ctx context.Context, txIDs []string) (map[str
 }
 
 // GetTokenRequest returns the token request bound to the passed transaction id, if available.
+// It returns nil without error if no request is stored for txID, which includes
+// the case of a row whose request column is present but zero-length: drivers
+// differ on whether such a column scans as nil or as an empty slice, and both
+// read as not-found here.
+//
+// Verification: the returned bytes are checked with
+// integrity.CheckStoredTokenRequest before they are handed back, so a request
+// that does not deserialize, declares an unsupported protocol version, or is
+// anchored to a transaction other than txID is reported as an error rather than
+// returned. Callers treat the result as authentic evidence about txID — they
+// hash it against the ledger, re-broadcast it, or show it to an auditor — so a
+// record that cannot be bound to txID must not reach them.
 func (d *StoreService) GetTokenRequest(ctx context.Context, txID string) ([]byte, error) {
-	return d.db.GetTokenRequest(ctx, txID)
+	raw, err := d.db.GetTokenRequest(ctx, txID)
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) == 0 {
+		// not found, which is not an error at this layer
+		return nil, nil
+	}
+	if err := integrity.CheckStoredTokenRequest(txID, raw); err != nil {
+		logger.ErrorfContext(ctx, "stored token request for [%s] failed the integrity check: %v", txID, err)
+
+		return nil, errors.WithMessagef(err, "stored token request for [%s] failed the integrity check", txID)
+	}
+
+	return raw, nil
 }
 
 // GetTokenRequests returns the token requests bound to the given tx ids in
 // a single query. See driver.TransactionStore.GetTokenRequests for details
 // about missing-key semantics.
+//
+// Empty values: an empty map value is treated as not-found (skipped),
+// consistent with GetTokenRequest returning nil, nil for a missing key. A
+// driver that does not omit the key for a zero-length request column returns it
+// as nil on some drivers and as an empty slice on others; both are silently
+// removed from the returned map rather than failing the call.
+//
+// Verification: as for GetTokenRequest, every non-nil entry is checked with
+// integrity.CheckStoredTokenRequest against the transaction id it is keyed
+// under. A single failing record fails the whole call: the caller asked for a
+// set of requests and cannot be expected to notice that one key silently went
+// missing.
 func (d *StoreService) GetTokenRequests(ctx context.Context, txIDs []string) (map[string][]byte, error) {
-	return d.db.GetTokenRequests(ctx, txIDs)
+	requests, err := d.db.GetTokenRequests(ctx, txIDs)
+	if err != nil {
+		return nil, err
+	}
+	for txID, raw := range requests {
+		if len(raw) == 0 {
+			delete(requests, txID)
+
+			continue
+		}
+		if err := integrity.CheckStoredTokenRequest(txID, raw); err != nil {
+			logger.ErrorfContext(ctx, "stored token request for [%s] failed the integrity check: %v", txID, err)
+
+			return nil, errors.WithMessagef(err, "stored token request for [%s] failed the integrity check", txID)
+		}
+	}
+
+	return requests, nil
 }
 
-// AddTransactionEndorsementAck records the signature of a given endorser for a given transaction
+// AddTransactionEndorsementAck records the signature of a given endorser for a given transaction.
+//
+// Verification: the caller must have verified sigma against the payload the
+// endorser signed before calling this — that payload is not persisted, so it is
+// the last point at which the signature can be checked. What this method
+// enforces is that the acknowledgement is not vacuous: an empty endorser or an
+// empty signature is rejected, because consumers read acknowledgements as a map
+// keyed by endorser and never inspect the values, so such a row would be
+// indistinguishable from a genuine acknowledgement.
 func (d *StoreService) AddTransactionEndorsementAck(ctx context.Context, txID string, id token.Identity, sigma []byte) error {
+	if txID == "" {
+		return errors.WithMessage(integrity.ErrEmptyTxID, "refusing to store endorsement ack")
+	}
+	if err := integrity.CheckEndorsementAck(id, sigma); err != nil {
+		return errors.WithMessagef(err, "refusing to store endorsement ack for txid [%s]", txID)
+	}
+
 	return d.db.AddTransactionEndorsementAck(ctx, txID, id, sigma)
 }
 
-// GetTransactionEndorsementAcks returns the endorsement signatures for the given transaction id
+// GetTransactionEndorsementAcks returns the endorsement signatures for the given transaction id.
+//
+// Verification: the signatures cannot be re-verified here, because the payload
+// they were produced over is not persisted alongside them. Each row is held to
+// the same non-vacuity AddTransactionEndorsementAck enforces — a non-empty
+// endorser and a non-empty signature — so a row that carries no signature is not
+// passed off as an acknowledgement.
+//
+// A row that fails the check is logged at ERROR and dropped from the result
+// rather than failing the call. Dropping keeps the damage to the offending row:
+// this map is read through ttx.TransactionInfo together with the transaction's
+// token request, so failing the call would make the transaction's *valid* acks
+// and its request unreadable too, and there is no API to remove the bad row.
+//
+// The map is keyed by the endorser's unique id, and the unique id of the empty
+// identity is a fixed sentinel rather than a hash, so a row with an empty
+// endorser is recognised by its key.
 func (d *StoreService) GetTransactionEndorsementAcks(ctx context.Context, txID string) (map[string][]byte, error) {
-	return d.db.GetTransactionEndorsementAcks(ctx, txID)
+	acks, err := d.db.GetTransactionEndorsementAcks(ctx, txID)
+	if err != nil {
+		return nil, err
+	}
+	emptyEndorserKey := token.Identity(nil).UniqueID()
+	for endorser, sigma := range acks {
+		if endorser == emptyEndorserKey {
+			logger.ErrorfContext(ctx, "dropping stored endorsement ack for [%s]: %v", txID, integrity.ErrEmptyEndorser)
+			delete(acks, endorser)
+
+			continue
+		}
+		if len(sigma) == 0 {
+			logger.ErrorfContext(ctx, "dropping stored endorsement ack of [%s] for [%s]: %v", endorser, txID, integrity.ErrEmptySignature)
+			delete(acks, endorser)
+		}
+	}
+
+	return acks, nil
+}
+
+// UpsertFindings records the drift findings observed by one checks sweep.
+func (d *StoreService) UpsertFindings(ctx context.Context, findings []dbdriver.FindingRecord, seenAt time.Time) error {
+	return d.db.UpsertFindings(ctx, findings, seenAt)
+}
+
+// ResolveFindingsNotSeenSince closes the open findings of the passed checkers that
+// the latest sweep did not observe.
+func (d *StoreService) ResolveFindingsNotSeenSince(ctx context.Context, checkers []string, seenAt time.Time) (int64, error) {
+	return d.db.ResolveFindingsNotSeenSince(ctx, checkers, seenAt)
+}
+
+// QueryFindings returns the stored drift findings matching params, worst first.
+func (d *StoreService) QueryFindings(ctx context.Context, params dbdriver.QueryFindingsParams) ([]*dbdriver.FindingRecord, error) {
+	return d.db.QueryFindings(ctx, params)
+}
+
+// CountOpenFindings returns how many open drift findings there currently are, per severity.
+func (d *StoreService) CountOpenFindings(ctx context.Context) (map[int]int64, error) {
+	return d.db.CountOpenFindings(ctx)
 }
 
 // AcquireRecoveryLeadership tries to acquire the DB-backed recovery leadership lease.
-func (d *StoreService) AcquireRecoveryLeadership(ctx context.Context, lockID int64) (dbdriver.RecoveryLeadership, bool, error) {
-	leadership, acquired, err := d.db.AcquireRecoveryLeadership(ctx, lockID)
+func (d *StoreService) AcquireRecoveryLeadership(ctx context.Context) (dbdriver.RecoveryLeadership, bool, error) {
+	leadership, acquired, err := d.db.AcquireRecoveryLeadership(ctx)
 	if err != nil {
 		return nil, false, errors.Wrapf(err, "failed to acquire recovery leadership")
+	}
+
+	return leadership, acquired, nil
+}
+
+// AcquireLeadership tries to acquire the DB-backed leadership lease identified by
+// lockID, independent of the recovery lease above.
+func (d *StoreService) AcquireLeadership(ctx context.Context, lockID int64) (dbdriver.RecoveryLeadership, bool, error) {
+	leadership, acquired, err := d.db.AcquireLeadership(ctx, lockID)
+	if err != nil {
+		return nil, false, errors.Wrapf(err, "failed to acquire leadership")
 	}
 
 	return leadership, acquired, nil
@@ -353,20 +505,17 @@ func TransactionRecords(ctx context.Context, record *token.AuditRecord, timestam
 	inputs := record.Inputs
 	outputs := record.Outputs
 
-	actionIndex := 0
-	for {
+	// Issue and transfer actions are numbered independently, so an action is named by its
+	// type and index together: grouping by index alone would merge issue action 0 with
+	// transfer action 0 and record the issued outputs as sent by the transfer's sender.
+	for _, action := range recordActions(record) {
 		// collect inputs and outputs from the same action
 		ins := inputs.Filter(func(t *token.Input) bool {
-			return t.ActionIndex == actionIndex
+			return t.ActionType == action.actionType && t.ActionIndex == action.actionIndex
 		})
 		ous := outputs.Filter(func(t *token.Output) bool {
-			return t.ActionIndex == actionIndex
+			return t.ActionType == action.actionType && t.ActionIndex == action.actionIndex
 		})
-		if ins.Count() == 0 && ous.Count() == 0 {
-			logger.DebugfContext(ctx, "no actions left for tx [%s][%d]", record.Anchor, actionIndex)
-
-			break
-		}
 
 		// create a transaction record from ins and ous
 
@@ -411,12 +560,45 @@ func TransactionRecords(ctx context.Context, record *token.AuditRecord, timestam
 				})
 			}
 		}
-
-		actionIndex++
 	}
 	logger.DebugfContext(ctx, "parsed transactions for tx [%s]", record.Anchor)
 
 	return txs, err
+}
+
+// recordAction names one action of a request: its type and its index among the actions of
+// that type.
+type recordAction struct {
+	actionType  request.ActionType
+	actionIndex int
+}
+
+// recordActions returns the actions that have at least one input or output in record,
+// ordered by index and then by type.
+func recordActions(record *token.AuditRecord) []recordAction {
+	seen := map[recordAction]struct{}{}
+	var actions []recordAction
+	add := func(a recordAction) {
+		if _, ok := seen[a]; !ok {
+			seen[a] = struct{}{}
+			actions = append(actions, a)
+		}
+	}
+	for _, in := range record.Inputs.Inputs() {
+		add(recordAction{actionType: in.ActionType, actionIndex: in.ActionIndex})
+	}
+	for _, out := range record.Outputs.Outputs() {
+		add(recordAction{actionType: out.ActionType, actionIndex: out.ActionIndex})
+	}
+	slices.SortFunc(actions, func(a, b recordAction) int {
+		if c := cmp.Compare(a.actionIndex, b.actionIndex); c != 0 {
+			return c
+		}
+
+		return cmp.Compare(a.actionType, b.actionType)
+	})
+
+	return actions
 }
 
 // Movements converts an AuditRecord to MovementRecords for storage in the database.

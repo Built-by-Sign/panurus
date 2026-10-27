@@ -10,9 +10,8 @@ import (
 	"context"
 	"database/sql"
 	"testing"
-	"time"
 
-	"github.com/hyperledger-labs/fabric-smart-client/platform/common/utils"
+	"github.com/LFDT-Panurus/panurus/token/services/utils"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/stretchr/testify/require"
 )
@@ -23,7 +22,7 @@ func TestAdvisoryLock_Acquisition(t *testing.T) {
 
 	db, err := sql.Open("pgx", pgConnStr)
 	require.NoError(t, err)
-	defer utils.IgnoreErrorFunc(db.Close)
+	defer utils.IgnoreError(db.Close)
 
 	ctx := context.Background()
 	lockID := int64(12345)
@@ -60,11 +59,11 @@ func TestAdvisoryLock_MultipleInstances(t *testing.T) {
 
 	db1, err := sql.Open("pgx", pgConnStr)
 	require.NoError(t, err)
-	defer utils.IgnoreErrorFunc(db1.Close)
+	defer utils.IgnoreError(db1.Close)
 
 	db2, err := sql.Open("pgx", pgConnStr)
 	require.NoError(t, err)
-	defer utils.IgnoreErrorFunc(db2.Close)
+	defer utils.IgnoreError(db2.Close)
 
 	ctx := context.Background()
 	lockID := int64(99999)
@@ -101,7 +100,7 @@ func TestAdvisoryLock_DoubleClose(t *testing.T) {
 
 	db, err := sql.Open("pgx", pgConnStr)
 	require.NoError(t, err)
-	defer utils.IgnoreErrorFunc(db.Close)
+	defer utils.IgnoreError(db.Close)
 
 	ctx := context.Background()
 	lockID := int64(54321)
@@ -126,26 +125,29 @@ func TestAdvisoryLock_ContextCancellation(t *testing.T) {
 
 	db, err := sql.Open("pgx", pgConnStr)
 	require.NoError(t, err)
-	defer utils.IgnoreErrorFunc(db.Close)
+	defer utils.IgnoreError(db.Close)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	lockID := int64(11111)
 
-	// Acquire lock with short-lived context
+	// Acquire the lock with a cancellable context. The context carries no deadline on
+	// purpose: sql.Open is lazy, so this first acquisition also dials and authenticates
+	// against the container, which on a loaded runner takes far longer than acquiring the
+	// lock does. A short deadline here covered that setup too and failed the test
+	// spuriously with "failed SASL auth: context deadline exceeded".
 	lock, acquired, err := NewAdvisoryLock(ctx, db, lockID)
 	require.NoError(t, err)
 	require.True(t, acquired)
 	require.NotNil(t, lock)
 
-	// Lock should still be valid even after context cancellation
-	// (advisory locks are session-scoped, not context-scoped)
-	time.Sleep(150 * time.Millisecond)
+	// Cancel the context that acquired the lock: advisory locks are session-scoped, not
+	// context-scoped, so the lock must remain held.
+	cancel()
 
 	// Verify lock is still held by trying to acquire it again
-	ctx2 := context.Background()
-	lock2, acquired, err := NewAdvisoryLock(ctx2, db, lockID)
+	lock2, acquired, err := NewAdvisoryLock(context.Background(), db, lockID)
 	require.NoError(t, err)
 	require.False(t, acquired, "Lock should still be held after context cancellation")
 	require.Nil(t, lock2)
@@ -161,23 +163,22 @@ func TestAdvisoryLockFactory(t *testing.T) {
 
 	db, err := sql.Open("pgx", pgConnStr)
 	require.NoError(t, err)
-	defer utils.IgnoreErrorFunc(db.Close)
+	defer utils.IgnoreError(db.Close)
 
 	ctx := context.Background()
-	lockID := int64(77777)
 
-	// Test factory function
-	factory := NewAdvisoryLockFactory()
+	// The factory binds its lock id at construction, so callers cannot pass one in.
+	factory := NewAdvisoryLockFactoryForID(int64(77777))
 	require.NotNil(t, factory)
 
 	// Use factory to create lock
-	lock, acquired, err := factory(ctx, db, lockID)
+	lock, acquired, err := factory(ctx, db)
 	require.NoError(t, err)
 	require.True(t, acquired)
 	require.NotNil(t, lock)
 
 	// Verify it's actually locked
-	lock2, acquired, err := factory(ctx, db, lockID)
+	lock2, acquired, err := factory(ctx, db)
 	require.NoError(t, err)
 	require.False(t, acquired)
 	require.Nil(t, lock2)
@@ -192,7 +193,7 @@ func TestAdvisoryLock_DifferentLockIDs(t *testing.T) {
 
 	db, err := sql.Open("pgx", pgConnStr)
 	require.NoError(t, err)
-	defer utils.IgnoreErrorFunc(db.Close)
+	defer utils.IgnoreError(db.Close)
 
 	ctx := context.Background()
 	lockID1 := int64(11111)
@@ -240,14 +241,13 @@ func TestRecoveryIntegration(t *testing.T) {
 	require.NoError(t, err)
 
 	// Test advisory lock acquisition through the store
-	lockID := int64(0x74746b7265636f76) // Default recovery lock ID
-	leadership, acquired, err := store.AcquireRecoveryLeadership(ctx, lockID)
+	leadership, acquired, err := store.AcquireRecoveryLeadership(ctx)
 	require.NoError(t, err)
 	require.True(t, acquired, "Should acquire leadership")
 	require.NotNil(t, leadership)
 
 	// Try to acquire again (should fail)
-	leadership2, acquired, err := store.AcquireRecoveryLeadership(ctx, lockID)
+	leadership2, acquired, err := store.AcquireRecoveryLeadership(ctx)
 	require.NoError(t, err)
 	require.False(t, acquired, "Should not acquire leadership when already held")
 	require.Nil(t, leadership2)
@@ -257,7 +257,61 @@ func TestRecoveryIntegration(t *testing.T) {
 	require.NoError(t, err)
 
 	// Should be able to acquire again
-	leadership3, acquired, err := store.AcquireRecoveryLeadership(ctx, lockID)
+	leadership3, acquired, err := store.AcquireRecoveryLeadership(ctx)
+	require.NoError(t, err)
+	require.True(t, acquired, "Should acquire leadership after release")
+	require.NotNil(t, leadership3)
+
+	err = leadership3.Close()
+	require.NoError(t, err)
+}
+
+// TestAuditRecoveryIntegration mirrors TestRecoveryIntegration for the audit
+// store. NewAuditTransactionStore used to leave recoveryLeaderFactory nil, so
+// AcquireRecoveryLeadership fell back to a no-op that always "wins" - every
+// replica sharing the database would believe itself the leader of the audit
+// store's recovery and checks sweeps at once. This asserts the audit store
+// takes a real, mutually exclusive advisory lock, the same as the owner store.
+func TestAuditRecoveryIntegration(t *testing.T) {
+	terminate, pgConnStr := startContainer(t)
+	defer terminate()
+
+	driver := NewDriver(postgresCfg(pgConnStr, "audit_recovery_test"))
+
+	ctx := context.Background()
+
+	storeInterface, err := driver.NewAuditTransaction("test", "audit_recovery_test")
+	require.NoError(t, err)
+	require.NotNil(t, storeInterface)
+
+	store, ok := storeInterface.(*AuditTransactionStore)
+	require.True(t, ok, "Store should be *AuditTransactionStore")
+
+	err = store.CreateSchema()
+	require.NoError(t, err)
+
+	leadership, acquired, err := store.AcquireRecoveryLeadership(ctx)
+	require.NoError(t, err)
+	require.True(t, acquired, "Should acquire leadership")
+	require.NotNil(t, leadership)
+
+	// A second replica, with its own driver and store instance on the same
+	// database, must not also acquire it: this is the exact bug the noop
+	// fallback caused, since it lets every caller "win" unconditionally.
+	replicaInterface, err := NewDriver(postgresCfg(pgConnStr, "audit_recovery_test")).NewAuditTransaction("test", "audit_recovery_test")
+	require.NoError(t, err)
+	replica, ok := replicaInterface.(*AuditTransactionStore)
+	require.True(t, ok, "Store should be *AuditTransactionStore")
+
+	leadership2, acquired, err := replica.AcquireRecoveryLeadership(ctx)
+	require.NoError(t, err)
+	require.False(t, acquired, "Should not acquire leadership when already held")
+	require.Nil(t, leadership2)
+
+	err = leadership.Close()
+	require.NoError(t, err)
+
+	leadership3, acquired, err := replica.AcquireRecoveryLeadership(ctx)
 	require.NoError(t, err)
 	require.True(t, acquired, "Should acquire leadership after release")
 	require.NotNil(t, leadership3)

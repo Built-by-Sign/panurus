@@ -13,11 +13,10 @@ import (
 )
 
 type FakeTokenStore struct {
-	AcquireCleanupLeadershipStub        func(context.Context, int64) (driver.CleanupLeadership, bool, error)
+	AcquireCleanupLeadershipStub        func(context.Context) (driver.CleanupLeadership, bool, error)
 	acquireCleanupLeadershipMutex       sync.RWMutex
 	acquireCleanupLeadershipArgsForCall []struct {
 		arg1 context.Context
-		arg2 int64
 	}
 	acquireCleanupLeadershipReturns struct {
 		result1 driver.CleanupLeadership
@@ -178,6 +177,22 @@ type FakeTokenStore struct {
 	}
 	getTokensReturnsOnCall map[int]struct {
 		result1 []*token.Token
+		result2 error
+	}
+	HasEnoughSpendableTokensStub        func(context.Context, string, token.Type, *big.Int) (bool, error)
+	hasEnoughSpendableTokensMutex       sync.RWMutex
+	hasEnoughSpendableTokensArgsForCall []struct {
+		arg1 context.Context
+		arg2 string
+		arg3 token.Type
+		arg4 *big.Int
+	}
+	hasEnoughSpendableTokensReturns struct {
+		result1 bool
+		result2 error
+	}
+	hasEnoughSpendableTokensReturnsOnCall map[int]struct {
+		result1 bool
 		result2 error
 	}
 	IsMineStub        func(context.Context, string, uint64) (bool, error)
@@ -342,6 +357,33 @@ type FakeTokenStore struct {
 	}
 	publicParamsByHashReturnsOnCall map[int]struct {
 		result1 []byte
+		result2 error
+	}
+	PublicParamsHashesStub        func(context.Context) ([]drivera.PPHash, error)
+	publicParamsHashesMutex       sync.RWMutex
+	publicParamsHashesArgsForCall []struct {
+		arg1 context.Context
+	}
+	publicParamsHashesReturns struct {
+		result1 []drivera.PPHash
+		result2 error
+	}
+	publicParamsHashesReturnsOnCall map[int]struct {
+		result1 []drivera.PPHash
+		result2 error
+	}
+	QuerySpendableTokensStub        func(context.Context, driver.SpendableTokensQuery) (drivera.SpendableTokensIterator, error)
+	querySpendableTokensMutex       sync.RWMutex
+	querySpendableTokensArgsForCall []struct {
+		arg1 context.Context
+		arg2 driver.SpendableTokensQuery
+	}
+	querySpendableTokensReturns struct {
+		result1 drivera.SpendableTokensIterator
+		result2 error
+	}
+	querySpendableTokensReturnsOnCall map[int]struct {
+		result1 drivera.SpendableTokensIterator
 		result2 error
 	}
 	QueryTokenDetailsStub        func(context.Context, driver.QueryTokenDetailsParams) ([]driver.TokenDetails, error)
@@ -512,19 +554,18 @@ type FakeTokenStore struct {
 	invocationsMutex sync.RWMutex
 }
 
-func (fake *FakeTokenStore) AcquireCleanupLeadership(arg1 context.Context, arg2 int64) (driver.CleanupLeadership, bool, error) {
+func (fake *FakeTokenStore) AcquireCleanupLeadership(arg1 context.Context) (driver.CleanupLeadership, bool, error) {
 	fake.acquireCleanupLeadershipMutex.Lock()
 	ret, specificReturn := fake.acquireCleanupLeadershipReturnsOnCall[len(fake.acquireCleanupLeadershipArgsForCall)]
 	fake.acquireCleanupLeadershipArgsForCall = append(fake.acquireCleanupLeadershipArgsForCall, struct {
 		arg1 context.Context
-		arg2 int64
-	}{arg1, arg2})
+	}{arg1})
 	stub := fake.AcquireCleanupLeadershipStub
 	fakeReturns := fake.acquireCleanupLeadershipReturns
-	fake.recordInvocation("AcquireCleanupLeadership", []interface{}{arg1, arg2})
+	fake.recordInvocation("AcquireCleanupLeadership", []interface{}{arg1})
 	fake.acquireCleanupLeadershipMutex.Unlock()
 	if stub != nil {
-		return stub(arg1, arg2)
+		return stub(arg1)
 	}
 	if specificReturn {
 		return ret.result1, ret.result2, ret.result3
@@ -538,17 +579,17 @@ func (fake *FakeTokenStore) AcquireCleanupLeadershipCallCount() int {
 	return len(fake.acquireCleanupLeadershipArgsForCall)
 }
 
-func (fake *FakeTokenStore) AcquireCleanupLeadershipCalls(stub func(context.Context, int64) (driver.CleanupLeadership, bool, error)) {
+func (fake *FakeTokenStore) AcquireCleanupLeadershipCalls(stub func(context.Context) (driver.CleanupLeadership, bool, error)) {
 	fake.acquireCleanupLeadershipMutex.Lock()
 	defer fake.acquireCleanupLeadershipMutex.Unlock()
 	fake.AcquireCleanupLeadershipStub = stub
 }
 
-func (fake *FakeTokenStore) AcquireCleanupLeadershipArgsForCall(i int) (context.Context, int64) {
+func (fake *FakeTokenStore) AcquireCleanupLeadershipArgsForCall(i int) context.Context {
 	fake.acquireCleanupLeadershipMutex.RLock()
 	defer fake.acquireCleanupLeadershipMutex.RUnlock()
 	argsForCall := fake.acquireCleanupLeadershipArgsForCall[i]
-	return argsForCall.arg1, argsForCall.arg2
+	return argsForCall.arg1
 }
 
 func (fake *FakeTokenStore) AcquireCleanupLeadershipReturns(result1 driver.CleanupLeadership, result2 bool, result3 error) {
@@ -1299,6 +1340,73 @@ func (fake *FakeTokenStore) GetTokensReturnsOnCall(i int, result1 []*token.Token
 	}
 	fake.getTokensReturnsOnCall[i] = struct {
 		result1 []*token.Token
+		result2 error
+	}{result1, result2}
+}
+
+func (fake *FakeTokenStore) HasEnoughSpendableTokens(arg1 context.Context, arg2 string, arg3 token.Type, arg4 *big.Int) (bool, error) {
+	fake.hasEnoughSpendableTokensMutex.Lock()
+	ret, specificReturn := fake.hasEnoughSpendableTokensReturnsOnCall[len(fake.hasEnoughSpendableTokensArgsForCall)]
+	fake.hasEnoughSpendableTokensArgsForCall = append(fake.hasEnoughSpendableTokensArgsForCall, struct {
+		arg1 context.Context
+		arg2 string
+		arg3 token.Type
+		arg4 *big.Int
+	}{arg1, arg2, arg3, arg4})
+	stub := fake.HasEnoughSpendableTokensStub
+	fakeReturns := fake.hasEnoughSpendableTokensReturns
+	fake.recordInvocation("HasEnoughSpendableTokens", []interface{}{arg1, arg2, arg3, arg4})
+	fake.hasEnoughSpendableTokensMutex.Unlock()
+	if stub != nil {
+		return stub(arg1, arg2, arg3, arg4)
+	}
+	if specificReturn {
+		return ret.result1, ret.result2
+	}
+	return fakeReturns.result1, fakeReturns.result2
+}
+
+func (fake *FakeTokenStore) HasEnoughSpendableTokensCallCount() int {
+	fake.hasEnoughSpendableTokensMutex.RLock()
+	defer fake.hasEnoughSpendableTokensMutex.RUnlock()
+	return len(fake.hasEnoughSpendableTokensArgsForCall)
+}
+
+func (fake *FakeTokenStore) HasEnoughSpendableTokensCalls(stub func(context.Context, string, token.Type, *big.Int) (bool, error)) {
+	fake.hasEnoughSpendableTokensMutex.Lock()
+	defer fake.hasEnoughSpendableTokensMutex.Unlock()
+	fake.HasEnoughSpendableTokensStub = stub
+}
+
+func (fake *FakeTokenStore) HasEnoughSpendableTokensArgsForCall(i int) (context.Context, string, token.Type, *big.Int) {
+	fake.hasEnoughSpendableTokensMutex.RLock()
+	defer fake.hasEnoughSpendableTokensMutex.RUnlock()
+	argsForCall := fake.hasEnoughSpendableTokensArgsForCall[i]
+	return argsForCall.arg1, argsForCall.arg2, argsForCall.arg3, argsForCall.arg4
+}
+
+func (fake *FakeTokenStore) HasEnoughSpendableTokensReturns(result1 bool, result2 error) {
+	fake.hasEnoughSpendableTokensMutex.Lock()
+	defer fake.hasEnoughSpendableTokensMutex.Unlock()
+	fake.HasEnoughSpendableTokensStub = nil
+	fake.hasEnoughSpendableTokensReturns = struct {
+		result1 bool
+		result2 error
+	}{result1, result2}
+}
+
+func (fake *FakeTokenStore) HasEnoughSpendableTokensReturnsOnCall(i int, result1 bool, result2 error) {
+	fake.hasEnoughSpendableTokensMutex.Lock()
+	defer fake.hasEnoughSpendableTokensMutex.Unlock()
+	fake.HasEnoughSpendableTokensStub = nil
+	if fake.hasEnoughSpendableTokensReturnsOnCall == nil {
+		fake.hasEnoughSpendableTokensReturnsOnCall = make(map[int]struct {
+			result1 bool
+			result2 error
+		})
+	}
+	fake.hasEnoughSpendableTokensReturnsOnCall[i] = struct {
+		result1 bool
 		result2 error
 	}{result1, result2}
 }
@@ -2065,6 +2173,135 @@ func (fake *FakeTokenStore) PublicParamsByHashReturnsOnCall(i int, result1 []byt
 	}
 	fake.publicParamsByHashReturnsOnCall[i] = struct {
 		result1 []byte
+		result2 error
+	}{result1, result2}
+}
+
+func (fake *FakeTokenStore) PublicParamsHashes(arg1 context.Context) ([]drivera.PPHash, error) {
+	fake.publicParamsHashesMutex.Lock()
+	ret, specificReturn := fake.publicParamsHashesReturnsOnCall[len(fake.publicParamsHashesArgsForCall)]
+	fake.publicParamsHashesArgsForCall = append(fake.publicParamsHashesArgsForCall, struct {
+		arg1 context.Context
+	}{arg1})
+	stub := fake.PublicParamsHashesStub
+	fakeReturns := fake.publicParamsHashesReturns
+	fake.recordInvocation("PublicParamsHashes", []interface{}{arg1})
+	fake.publicParamsHashesMutex.Unlock()
+	if stub != nil {
+		return stub(arg1)
+	}
+	if specificReturn {
+		return ret.result1, ret.result2
+	}
+	return fakeReturns.result1, fakeReturns.result2
+}
+
+func (fake *FakeTokenStore) PublicParamsHashesCallCount() int {
+	fake.publicParamsHashesMutex.RLock()
+	defer fake.publicParamsHashesMutex.RUnlock()
+	return len(fake.publicParamsHashesArgsForCall)
+}
+
+func (fake *FakeTokenStore) PublicParamsHashesCalls(stub func(context.Context) ([]drivera.PPHash, error)) {
+	fake.publicParamsHashesMutex.Lock()
+	defer fake.publicParamsHashesMutex.Unlock()
+	fake.PublicParamsHashesStub = stub
+}
+
+func (fake *FakeTokenStore) PublicParamsHashesArgsForCall(i int) context.Context {
+	fake.publicParamsHashesMutex.RLock()
+	defer fake.publicParamsHashesMutex.RUnlock()
+	argsForCall := fake.publicParamsHashesArgsForCall[i]
+	return argsForCall.arg1
+}
+
+func (fake *FakeTokenStore) PublicParamsHashesReturns(result1 []drivera.PPHash, result2 error) {
+	fake.publicParamsHashesMutex.Lock()
+	defer fake.publicParamsHashesMutex.Unlock()
+	fake.PublicParamsHashesStub = nil
+	fake.publicParamsHashesReturns = struct {
+		result1 []drivera.PPHash
+		result2 error
+	}{result1, result2}
+}
+
+func (fake *FakeTokenStore) PublicParamsHashesReturnsOnCall(i int, result1 []drivera.PPHash, result2 error) {
+	fake.publicParamsHashesMutex.Lock()
+	defer fake.publicParamsHashesMutex.Unlock()
+	fake.PublicParamsHashesStub = nil
+	if fake.publicParamsHashesReturnsOnCall == nil {
+		fake.publicParamsHashesReturnsOnCall = make(map[int]struct {
+			result1 []drivera.PPHash
+			result2 error
+		})
+	}
+	fake.publicParamsHashesReturnsOnCall[i] = struct {
+		result1 []drivera.PPHash
+		result2 error
+	}{result1, result2}
+}
+
+func (fake *FakeTokenStore) QuerySpendableTokens(arg1 context.Context, arg2 driver.SpendableTokensQuery) (drivera.SpendableTokensIterator, error) {
+	fake.querySpendableTokensMutex.Lock()
+	ret, specificReturn := fake.querySpendableTokensReturnsOnCall[len(fake.querySpendableTokensArgsForCall)]
+	fake.querySpendableTokensArgsForCall = append(fake.querySpendableTokensArgsForCall, struct {
+		arg1 context.Context
+		arg2 driver.SpendableTokensQuery
+	}{arg1, arg2})
+	stub := fake.QuerySpendableTokensStub
+	fakeReturns := fake.querySpendableTokensReturns
+	fake.recordInvocation("QuerySpendableTokens", []interface{}{arg1, arg2})
+	fake.querySpendableTokensMutex.Unlock()
+	if stub != nil {
+		return stub(arg1, arg2)
+	}
+	if specificReturn {
+		return ret.result1, ret.result2
+	}
+	return fakeReturns.result1, fakeReturns.result2
+}
+
+func (fake *FakeTokenStore) QuerySpendableTokensCallCount() int {
+	fake.querySpendableTokensMutex.RLock()
+	defer fake.querySpendableTokensMutex.RUnlock()
+	return len(fake.querySpendableTokensArgsForCall)
+}
+
+func (fake *FakeTokenStore) QuerySpendableTokensCalls(stub func(context.Context, driver.SpendableTokensQuery) (drivera.SpendableTokensIterator, error)) {
+	fake.querySpendableTokensMutex.Lock()
+	defer fake.querySpendableTokensMutex.Unlock()
+	fake.QuerySpendableTokensStub = stub
+}
+
+func (fake *FakeTokenStore) QuerySpendableTokensArgsForCall(i int) (context.Context, driver.SpendableTokensQuery) {
+	fake.querySpendableTokensMutex.RLock()
+	defer fake.querySpendableTokensMutex.RUnlock()
+	argsForCall := fake.querySpendableTokensArgsForCall[i]
+	return argsForCall.arg1, argsForCall.arg2
+}
+
+func (fake *FakeTokenStore) QuerySpendableTokensReturns(result1 drivera.SpendableTokensIterator, result2 error) {
+	fake.querySpendableTokensMutex.Lock()
+	defer fake.querySpendableTokensMutex.Unlock()
+	fake.QuerySpendableTokensStub = nil
+	fake.querySpendableTokensReturns = struct {
+		result1 drivera.SpendableTokensIterator
+		result2 error
+	}{result1, result2}
+}
+
+func (fake *FakeTokenStore) QuerySpendableTokensReturnsOnCall(i int, result1 drivera.SpendableTokensIterator, result2 error) {
+	fake.querySpendableTokensMutex.Lock()
+	defer fake.querySpendableTokensMutex.Unlock()
+	fake.QuerySpendableTokensStub = nil
+	if fake.querySpendableTokensReturnsOnCall == nil {
+		fake.querySpendableTokensReturnsOnCall = make(map[int]struct {
+			result1 drivera.SpendableTokensIterator
+			result2 error
+		})
+	}
+	fake.querySpendableTokensReturnsOnCall[i] = struct {
+		result1 drivera.SpendableTokensIterator
 		result2 error
 	}{result1, result2}
 }

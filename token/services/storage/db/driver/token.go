@@ -49,8 +49,9 @@ type TokenRecord struct {
 	Quantity string
 	// Type is the type of token
 	Type token.Type
-	// Amount is the Quantity converted to decimal
-	Amount uint64
+	// Amount is the Quantity converted to decimal as a big integer to support arbitrary
+	// precision. It must be non-nil and match Quantity.
+	Amount *big.Int
 	// Owner is used to mark the token as owned by this node
 	Owner bool
 	// Auditor is used to mark this token as audited by this node
@@ -108,6 +109,61 @@ type QueryTokenDetailsParams struct {
 	Spendable SpendableFilter
 	// LedgerTokenFormats selects tokens whose output on the ledger has a format in the list
 	LedgerTokenFormats []token.Format
+	// MinAmount, when non-nil, keeps only tokens whose amount is greater than or equal to it.
+	// The bound is inclusive: a token worth exactly MinAmount matches.
+	//
+	// The bound is compared against the amount column, which mirrors the authoritative
+	// quantity. On SQLite the comparison is exact only up to int64: that backend gives a
+	// NUMERIC column NUMERIC affinity and converts a wider integer literal to REAL, which is
+	// the same limit that already applies to the stored amounts.
+	MinAmount *big.Int
+	// MaxAmount, when non-nil, keeps only tokens whose amount is less than or equal to it.
+	// The bound is inclusive, with the same precision caveat as MinAmount.
+	MaxAmount *big.Int
+}
+
+// AmountOrder selects the order in which a query returns rows with respect to their amount.
+type AmountOrder int
+
+const (
+	// AmountUnordered adds no ORDER BY clause, leaving the row order to the backend. It is
+	// the zero value, so a query that does not ask for an order keeps the cheapest plan.
+	AmountUnordered AmountOrder = iota
+	// AmountAscending orders rows by amount, smallest first.
+	AmountAscending
+	// AmountDescending orders rows by amount, largest first.
+	AmountDescending
+)
+
+// SpendableTokensQuery bounds a scan over the spendable tokens of a wallet.
+//
+// The zero value selects every spendable token of every wallet and type, unordered and
+// unlimited. SpendableTokensIteratorBy is that query with Order set to AmountAscending,
+// which sherdlock's candidate scan requires (#2395); the two otherwise agree, and in
+// particular every spendable-token query hides the tokens another consumer currently holds
+// a lock on.
+//
+// A store may satisfy WalletID, TokenType, the amount bounds and Order from a single index
+// on (owner_wallet_id, token_type, amount), so a caller that needs only a few tokens can ask
+// for a bounded window instead of the wallet's whole spendable set.
+type SpendableTokensQuery struct {
+	// WalletID restricts the scan to the tokens owned by this wallet. Empty means any wallet.
+	WalletID string
+	// TokenType restricts the scan to this token type. Empty means any type.
+	TokenType token.Type
+	// MinAmount, when non-nil, keeps only tokens worth at least this much (inclusive).
+	MinAmount *big.Int
+	// MaxAmount, when non-nil, keeps only tokens worth at most this much (inclusive).
+	MaxAmount *big.Int
+	// Order sets the order of the returned rows. Rows of equal amount come back in
+	// unspecified order, so Order does not make the result a stable sequence.
+	Order AmountOrder
+	// Limit caps the number of rows returned. Zero or negative means no cap.
+	//
+	// Because tokens of equal amount are returned in unspecified order, Limit describes a
+	// window, not a page: two queries differing only in Limit may disagree about which of
+	// several equal-amount tokens they include.
+	Limit int
 }
 
 type SpendableFilter int
@@ -201,6 +257,20 @@ type TokenStore interface {
 	UnspentTokensIteratorBy(ctx context.Context, walletID string, tokenType token.Type) (driver.UnspentTokensIterator, error)
 	// SpendableTokensIteratorBy returns an iterator over all tokens owned solely by the passed wallet identifier and of a given type
 	SpendableTokensIteratorBy(ctx context.Context, walletID string, typ token.Type) (driver.SpendableTokensIterator, error)
+	// QuerySpendableTokens returns an iterator over the spendable tokens matching params.
+	// It is SpendableTokensIteratorBy with amount bounds, an optional order and an optional
+	// limit, for callers that need only part of a wallet's spendable set: passing the zero
+	// value selects everything, exactly as SpendableTokensIteratorBy does.
+	QuerySpendableTokens(ctx context.Context, params SpendableTokensQuery) (driver.SpendableTokensIterator, error)
+	// HasEnoughSpendableTokens reports whether the wallet's total spendable balance of typ
+	// is at least target, ignoring any lock currently held on the underlying tokens: it
+	// answers "can this wallet ever pay", not "can it pay right now". Used as a sum-aware
+	// fast fail so a wallet that could never cover the requested amount fails immediately
+	// instead of burning the selector's immediate-retry/backoff budget first, and to tell
+	// "genuinely insufficient funds" apart from "funds exist but are all locked right now"
+	// when SpendableTokensIteratorBy's anti-join against locked tokens (#2395) hides every
+	// candidate from the caller.
+	HasEnoughSpendableTokens(ctx context.Context, walletID string, typ token.Type, target *big.Int) (bool, error)
 	// UnsupportedTokensIteratorBy returns the minimum information for upgrade about the tokens that are not supported
 	UnsupportedTokensIteratorBy(ctx context.Context, walletID string, tokenType token.Type) (driver.UnsupportedTokensIterator, error)
 	// ListUnspentTokensBy returns the list of all tokens owned by the passed identifier of a given type
@@ -260,7 +330,19 @@ type TokenStore interface {
 	PublicParams(ctx context.Context) ([]byte, error)
 	// PublicParamsByHash returns the public parameters whose hash matches the passed one.
 	// If not public parameters are available for that hash, it returns an error
+	//
+	// Verification: an implementation must hash the parameters it is about to
+	// return and compare against rawHash — see
+	// integrity.CheckPublicParamsHash. Public parameters carry the issuer and
+	// auditor keys and the cryptographic setup every action is validated against,
+	// and a caller fetching by hash is asking for the setup one specific
+	// transaction was created under. An empty rawHash is refused, since it makes
+	// the comparison vacuous.
 	PublicParamsByHash(ctx context.Context, rawHash driver.PPHash) ([]byte, error)
+	// PublicParamsHashes returns the hashes of all the public parameters stored so far,
+	// most recently stored first. It is used to trace a token back to the public parameters
+	// that produced its format, for example when upgrading tokens whose format changed.
+	PublicParamsHashes(ctx context.Context) ([]driver.PPHash, error)
 	// NewTokenDBTransaction returns a new Transaction to commit atomically multiple operations
 	NewTokenDBTransaction() (TokenStoreTransaction, error)
 	// ContinueTokenDBTransaction returns a new TokenStoreTransaction building upon the passed transaction.
@@ -294,7 +376,7 @@ type TokenStore interface {
 	// Returns (leadership, true, nil) if leadership was acquired.
 	// Returns (nil, false, nil) if leadership is held by another instance.
 	// Returns (nil, false, error) if an error occurred.
-	AcquireCleanupLeadership(ctx context.Context, lockID int64) (CleanupLeadership, bool, error)
+	AcquireCleanupLeadership(ctx context.Context) (CleanupLeadership, bool, error)
 }
 
 type (
@@ -329,6 +411,40 @@ type TokenNotifier interface {
 	UnsubscribeAll() error
 }
 
+// IsTerminalStatus reports whether status is a terminal status of a consuming
+// transaction — i.e. one after which the lock it holds should already have been
+// released. A LockRecord still present with a terminal-status consumer is the
+// mechanism-4 leak from #2395: nothing on the success path called UnlockByTxID, so
+// the row survived until the next lease-age sweep. A nil status (no matching row in
+// the requests table) is never terminal.
+func IsTerminalStatus(status *TxStatus) bool {
+	if status == nil {
+		return false
+	}
+
+	switch *status {
+	case Confirmed, Deleted, Orphan:
+		return true
+	default:
+		return false
+	}
+}
+
+// LockRecord describes a single held token lock, joined with the terminal-status
+// view of its consuming transaction. Status is nil when the consuming transaction has
+// no matching row in the requests table (should not normally happen, since a lock is
+// only ever created for a transaction that has one).
+type LockRecord struct {
+	// TokenID is the locked token (the (tx_id, idx) of the transaction that created it).
+	TokenID token.ID
+	// ConsumerTxID is the transaction attempting to spend TokenID.
+	ConsumerTxID transaction.ID
+	// CreatedAt is when the lock was taken (see LockAt).
+	CreatedAt time.Time
+	// Status is the current status of ConsumerTxID, or nil if unknown.
+	Status *TxStatus
+}
+
 // TokenLockStore enforces that a token be used only by one process
 // A housekeeping job can clean up expired locks (e.g. created_at is more than 5 minutes ago) in order to:
 // - avoid that the table grows infinitely
@@ -347,6 +463,11 @@ type TokenLockStore interface {
 	LockAt(ctx context.Context, tokenID *token.ID, consumerTxID transaction.ID, walletID string, createdAt time.Time) error
 	// UnlockByTxID unlocks all tokens locked by the consumer TX
 	UnlockByTxID(ctx context.Context, consumerTxID transaction.ID) error
+	// ListLocks returns every currently held lock, joined with the status of its
+	// consuming transaction. It is a read-only diagnostic: it exists so that operators
+	// and tests can inspect lock state without racing a second Lock call against the
+	// primary key (see #2395). It does no filtering; callers select/rank as needed.
+	ListLocks(ctx context.Context) ([]LockRecord, error)
 	// Cleanup removes stale token locks. A lock is stale when either:
 	// 1. The *consuming* transaction (the one trying to spend the token,
 	//    identified by consumer_tx_id) has reached a terminal failure status
@@ -366,9 +487,53 @@ type TokenLockStore interface {
 	Close() error
 }
 
+// BatchLockOutcome reports, per candidate, how a batched lock claim resolved. Won lists
+// the tokens actually claimed. Stale lists the candidates the store refused because they
+// are no longer spendable - the batch counterpart of ErrTokenNotSpendable on the
+// single-token Lock path. Every candidate in neither set lost a race: another claimant
+// already holds its lock, the counterpart of ErrTokenAlreadyLocked. The two sets are
+// disjoint subsets of the candidates the caller passed in, so "lost a race" is the
+// complement and needs no third slice.
+//
+// A backend that cannot tell the two reasons apart may leave Stale empty, in which case
+// every unwon candidate reads as a lost race. That is sound - a selector drops an unwon
+// candidate whichever reason it was unwon for - but it is only sound, not informative:
+// the distinction is what lets a selector drop a stale candidate for good and refresh its
+// candidate cache, rather than wait for contention that no one is causing.
+//
+// An outcome returned alongside a non-nil error is partial, not empty: a store whose claim
+// commits before it reports (an INSERT ... RETURNING, say) can fail while reading its own
+// result, and the verdicts it read before failing are still authoritative - the locks are
+// held. Such a store must return them, and a caller must use them, since locks that are
+// held but never reported are unusable by anyone until the lease expires. Candidates with
+// no verdict at all are simply unclassified: neither won nor known stale. See #2395.
+type BatchLockOutcome struct {
+	Won   []*token.ID
+	Stale []*token.ID
+}
+
 var (
 	ErrTokenDoesNotExist = errors.New("token does not exist")
 	// ErrTokenAlreadyLocked is returned by TokenLockStore.Lock when the token is
 	// already locked by another transaction (primary-key conflict on the lock row).
 	ErrTokenAlreadyLocked = errors.New("token already locked")
+	// ErrTokenNotSpendable is returned by TokenLockStore.Lock when the token still
+	// exists but is no longer spendable - it has been spent (is_deleted), marked
+	// non-spendable, or is not owned by this node. Unlike ErrTokenAlreadyLocked it is
+	// not contention: no amount of waiting makes the token available again, because the
+	// candidate itself is stale. A selector serving candidates from a cache can observe
+	// this for a token that was spendable when the snapshot was taken and spent since,
+	// and must drop the candidate and refresh rather than retry it. Keeping the two
+	// apart is what stops such a stale candidate from being returned to the caller, who
+	// would then fail to load it. See #2395.
+	ErrTokenNotSpendable = errors.New("token is not spendable")
+	// ErrAmountMissing is returned when a record carries no amount. The amount column is NOT NULL.
+	ErrAmountMissing = errors.New("no amount specified")
+	// ErrAmountOutOfRange is returned when an amount is too wide for the amount column to hold.
+	// Storing it would leave the amount disagreeing with the authoritative quantity.
+	ErrAmountOutOfRange = errors.New("amount exceeds maximum supported size")
+	// ErrAmountNegative is returned when a token record carries a negative amount. Token
+	// quantities are unsigned, so a negative amount means the record was built outside
+	// token.ToQuantity. Movement and transaction amounts are signed and are not affected.
+	ErrAmountNegative = errors.New("amount is negative")
 )

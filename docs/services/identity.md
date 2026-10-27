@@ -123,6 +123,45 @@ A wallet identifier registered with a `nil` wallet counts as absent, both on the
 creation double-checks the cache; a factory that returns no wallet and no error is reported as an
 error.
 
+### Wallet accessor error contract
+
+`wallet.Service`'s role accessors — `OwnerWallet`, `IssuerWallet`, `AuditorWallet`,
+`CertifierWallet`, and the `RegisterOwnerIdentity` / `RegisterIssuerIdentity` /
+`OwnerWalletIDs` delegators — return a typed error rather than panicking on a
+misconfiguration or a non-conforming implementation:
+
+*   **Missing role registry.** If `RoleRegistries` has no (or a `nil`) entry for the role
+    the accessor indexes into, the accessor returns `no registry configured for <role> role`
+    instead of a nil-interface method-call panic. `NewService` does not reject an incomplete
+    `RoleRegistries` up front; the guard is applied lazily, at first use of the affected role.
+*   **Wrong wallet type.** A `RoleRegistry.WalletByID` implementation that returns a
+    `driver.Wallet` not satisfying the concrete role interface the accessor expects (e.g. a
+    wallet that does not implement `driver.OwnerWallet`) yields
+    `wallet [<concrete-type>] for <role> role lookup [<id>] does not implement the expected wallet interface`,
+    rather than a failed type assertion panicking the calling goroutine. The message reports the
+    wallet's concrete Go type (via `%T`) and the lookup id, never the wallet's own id, so the
+    error path stays panic-free even when the registry hands back a typed-nil wallet whose type
+    *fails* the assertion. This is the failure mode a custom or partially-implemented
+    `WalletFactory` can produce.
+*   **Nil wallet.** A registry that returns a wallet which is nil — either a nil
+    `driver.Wallet` interface, or a non-nil interface wrapping a nil pointer whose concrete type
+    *does* satisfy the expected role interface (so the type assertion succeeds) — yields
+    `registry for <role> role returned a nil wallet for lookup [<id>]`. Without this guard the
+    accessor would hand the typed-nil back to the caller, whose first method call (e.g.
+    `wallet.ID()` in `authorization.IsMine`) would then panic.
+
+Each guard above also emits a `Warn`-level log when it trips, because the main consumers in
+`token/core/common/authorization.go` treat any accessor error as "not my wallet" and degrade
+silently — so a mis-wired role would otherwise leave no trace. The guards never trip for the
+shipped drivers, which always wire all four roles with the correct wallet types, so this adds
+no log noise on a correctly configured node.
+
+`Service.Wallet` (the best-effort owner-then-issuer resolver) still treats these as
+"no wallet found" and returns `nil` to its caller, but it now logs the dropped owner/issuer
+accessor error at debug level rather than discarding it silently — so a misconfiguration
+(e.g. no owner *and* no issuer registry) that makes `Wallet` return `nil` leaves a trace,
+while the explicit accessors still surface the error to their callers.
+
 ### LocalMembership
 
 The `LocalMembership` component (`token/services/identity/membership`) plays a pivotal role in managing local identities for a specific role (e.g., Owner, Issuer).
@@ -137,6 +176,15 @@ The `LocalMembership` component (`token/services/identity/membership`) plays a p
     each returned `KeyManager` must either be independently owned by the caller or safe for concurrent `EnrollmentID` calls — and the results
     are committed to the in-memory indices sequentially in the original store order, so identity ordering (e.g. fallback default selection,
     same-name tie-breaks) is deterministic.
+*   **Reloading replaces, it does not merge**: `Load` may be called more than once on the same `LocalMembership`, and each call is a full
+    replacement of the in-memory view. It resets **all four** indices — `localIdentities`, `localIdentitiesByName`,
+    `localIdentitiesByConfig` and `localIdentitiesByIdentity` — plus the cached default identifier, so an identity that was present only in an
+    earlier `Load` no longer resolves. `localIdentitiesByIdentity` is the map consulted after a miss on `localIdentitiesByName` (by both
+    `lookup` and `getLocalIdentity`, reached from `GetIdentifier` and `GetIdentityInfo`); leaving it unreset was the stale-read fixed for
+    [#2073](https://github.com/LFDT-Panurus/panurus/issues/2073). Anything added to `LocalMembership` that indexes identities must be reset
+    there too.
+*   **Teardown**: `Close` releases every `KeyManager` this membership loaded (those implementing `Close`), unregisters its own `conf_id`s from
+    the `SignerRouter` (see below), and unsubscribes from the identity-store notifier. It is idempotent.
 
 ### Example: Wiring Services
 
@@ -187,6 +235,11 @@ func (d *Base) NewWalletService(...) (*wallet.Service, error) {
 *   **Wiring**: a driver builds a `SignerRouter` with `identity.NewSignerRouter(m *Metrics)`, registers `KeyManager`s against their `conf_id` with `Register`, sets a `ConfIDResolver` with `SetConfIDResolver`, and attaches it to the `Provider` with `Provider.SetSignerRouter`. See `token/core/fabtoken/v1/driver/ws.go` and the zkatdlog equivalent.
 *   **Fallback semantics**: `Resolve` returns `ok=false` (never an error) whenever routing cannot be attempted (no resolver set, no `conf_id` mapping, no `KeyManager` registered for it) or the routed `KeyManager` itself fails — callers always fall back to the probing deserializer in that case, never treating it as a hard failure.
 *   **Probe-free deserialization**: when the registered `KeyManager` also implements `idriver.ProbeFreeSignerDeserializer`, `Resolve` calls `DeserializeSignerNoProbe` directly, skipping the cryptographic probe that the fallback path relies on to catch a mismatched `KeyManager`. This is only safe because the `conf_id` already pins the identity to exactly one `KeyManager`.
+*   **Teardown**: a registration pins its `KeyManager` — and, for idemix, the BCCSP instance and `IdentityCache` behind it — for as long as the entry lives, so registrations have an explicit lifecycle:
+    *   `Unregister(confIDs ...string)` drops specific entries. `LocalMembership.Close` calls it with the `conf_id`s of its own local identities right after closing their `KeyManager`s, so a released `KeyManager` is never left routable with the probe skipped. Because `conf_id` is derived from `(ID, Type, URL)` with `Type` being the membership's identity type, one role's teardown cannot unpin another's entries.
+    *   `Close()` drops every entry, for tearing down a whole router. It does not close the `KeyManager`s themselves — the router borrows them; `LocalMembership` owns them. The router stays usable afterwards.
+    *   `Len()` reports how many bindings are currently held.
+    *   Both are idempotent, and unregistering an unknown `conf_id` is a no-op. After either, `Resolve` reports `ok=false` for the affected identities and callers fall back to the probing deserializer — correct, just without the fast path.
 
 #### conf_id must be collision-free
 
@@ -292,6 +345,38 @@ any other resource, give it a `Close()` method and it will be released automatic
 
 > **Note:** tests that exercise an anonymous owner wallet should `t.Cleanup(w.Close)`,
 > otherwise each test leaves a provisioning goroutine behind for the rest of the run.
+
+## Identity Registration Checks
+
+Every path that binds something to an identity — audit info, token metadata, signer info, a signer —
+first requires the identity to be **non-empty**, and refuses it outright otherwise. This is not
+input tidying. Identity rows and the provider's caches are keyed by `Identity.UniqueID()`, which maps
+the empty identity to the literal string `<empty>` rather than to a hash, so every empty identity
+would collapse onto one row and one cache entry: one caller's audit info would be readable by any
+other empty-identity lookup, and a signer registered for one would be handed back for another. The
+guard therefore also applies to ephemeral registrations, which write nothing to storage but populate
+the same caches.
+
+Two further checks apply where the information to make them exists:
+
+*   `wallet.Service.RegisterRecipientIdentity` matches the recipient identity against its audit info
+    (`Deserializer.MatchIdentity`) and requires that an **owner verifier can be derived from it**. An
+    identity no verifier can be built from is one whose tokens could never be spent, and both checks
+    route through the same typed-identity deserializer, so the second cannot reject an identity the
+    first accepts.
+*   `token.SignatureService.RegisterSigner` and `RegisterEphemeralSigner` require that a **verifier
+    is derivable** from the identity a signer is being bound to. The owner deserializer is the one
+    asked: every driver in the tree builds `common.NewDeserializer` from a single
+    `TypedVerifierDeserializerMultiplex`, so the owner, issuer and auditor deserializers are the same
+    object and route by identity type rather than by role. They deliberately do not compare a
+    supplied `Verifier` against the identity; `driver.Verifier` exposes only `Verify`, so there is no
+    canonical key to compare.
+
+On the read side, `GetAuditInfo`, `GetTokenInfo`, and (on the SQL backend) `GetSignerInfo` locate a
+row by identity hash and then compare the **stored** identity against the requested one before
+returning or caching anything, so a hash-addressed read cannot silently return another identity's
+data. For the full posture, including the KVS backend's inability to make the last comparison, see
+[**Store Integrity Verification**](../security/store_integrity_verification.md).
 
 ## Identity Types
 
@@ -483,6 +568,22 @@ flows), so both `crypto.AuditInfo.FromBytes`
 (`token/services/identity/idemixnym/nym/audit.go`) treat their input as untrusted and reject
 malformed payloads with an error.
 
+Both decode through the project's strict JSON wrapper
+(`token/core/common/encoding/json`, which sets `DisallowUnknownFields`) — the same logical type
+must not be parsed more leniently just because it arrived through a different entry point.
+`nym.AuditInfo` additionally rejects a payload that carries none of the promoted
+`crypto.AuditInfo` fields: `encoding/json` leaves the embedded pointer nil in that case, and
+`FromBytes` returning success there would hand the caller a value whose promoted methods and
+fields nil-dereference. Both strictness gaps were closed for
+[#2073](https://github.com/LFDT-Panurus/panurus/issues/2073).
+
+`crypto.AuditInfo.Validate` guarantees only the four `Attributes` entries the default schema
+needs, while the schema string travels in the same payload and selects the positions
+`schema.DefaultManager` indexes — up to `Attributes[27]` for `w3c-v0.0.1`. `EidNymAuditOpts` and
+`RhNymAuditOpts` therefore bounds-check before indexing and return an error for an
+attribute-count/schema mismatch, rather than relying on callers to overwrite `Schema` with a
+trusted value first (which `idemixnym.KeyManager.DeserializeAuditInfo` does do today).
+
 `EidNymAuditData` and `RhNymAuditData` embed `mathlib` curve elements, which JSON-encode as
 a curve ID plus the raw element bytes:
 
@@ -548,6 +649,7 @@ Located in `token/services/identity/boolpolicy`.
     - `TypedIdentity` payload: ASN.1 DER.
     - Audit Info: JSON.
 *   **Signature Representation**: An ASN.1 `PolicySignature` (`SEQUENCE OF OCTET STRING`) where each slot corresponds to one component identity. A slot may be nil/empty when that component does not need to sign (valid for OR branches).
+*   **Verification**: `PolicyVerifier.Verify` rejects a `PolicySignature` whose slot count differs from `len(Verifiers)`, then walks the AST memoising each `$N`'s outcome so a repeated reference verifies at most once. Every `$N` is additionally bounds-checked against the signature slots, the memo and `Verifiers` at the point each is indexed, and a nil `Verifiers` entry fails the reference: an out-of-range or unset slot is an unsatisfied reference, never a panic, independently of the length check in `Verify`.
 *   **Implementation**: `token/services/identity/boolpolicy`.
 
 #### HTLC (Hashed Time Lock Contract)
@@ -565,6 +667,8 @@ Located in `token/services/identity/interop/htlc`.
     - `TypedIdentity` payload: JSON.
     - Audit Info: JSON.
 *   **Behavior**: Validation involves satisfying the script conditions (e.g., providing the hash preimage).
+*   **Parsing strictness**: the `Script` in a `TypedIdentity`, the `ScriptInfo` audit info and the `ClaimSignature` are all parsed with the strict JSON wrapper (`DisallowUnknownFields`), in `validator.go` and `info.go` as well as in `deserializer.go` — the validator must not accept a payload the deserializer would reject.
+*   **Preimage comparison**: `MetadataClaimKeyCheck` compares the claim's preimage against the action's metadata entry with `subtle.ConstantTimeCompare`. Not a practical timing oracle today (the same transaction reveals the preimage in the clear), but the property costs nothing to keep.
 
 ## Extending the Identity Service
 
@@ -640,17 +744,19 @@ func (a *EscrowAuth) Issued(_ context.Context, _ driver.Identity, _ *token.Token
 func (a *EscrowAuth) OwnerType(raw []byte) (driver.IdentityType, []byte, error)        { ... }
 ```
 
-Register it in **both** driver files inside `NewAuthorizationMultiplexer`:
+Register it in `common.NewStandardAuthorization` (`token/core/common/authorization.go`), the chain both drivers use. Order matters: the multiplexer is first-match-wins and `NewTMSAuthorization` resolves *any* identity bound to a wallet — including composite identities — so it would claim the token under the wrong wallet id and drop its ownership entries. Every type-gated authorization must therefore be registered **before** the trailing `NewTMSAuthorization` catch-all (regression: `TestAuthorizationOrder_BoundPolicyIdentity` in `token/services/ttx/boolpolicy/auth_test.go`).
 
 ```go
-// token/core/fabtoken/v1/driver/driver.go  (and the zkatdlog equivalent)
-authorization := common.NewAuthorizationMultiplexer(
-    common.NewTMSAuthorization(...),
-    htlc.NewScriptAuth(ws),
-    multisig.NewEscrowAuth(ws),
-    boolpolicy.NewEscrowAuth(ws),
-    mynew.NewEscrowAuth(ws),   // ← add here
-)
+// token/core/common/authorization.go
+func NewStandardAuthorization(logger logging.Logger, publicParameters driver.PublicParameters, walletService driver.WalletService) *AuthorizationMultiplexer {
+	return NewAuthorizationMultiplexer(
+		htlc.NewScriptAuth(walletService),
+		multisig.NewEscrowAuth(walletService),
+		boolpolicy.NewEscrowAuth(walletService),
+		mynew.NewEscrowAuth(walletService), // ← add here, before the wallet-based catch-all
+		NewTMSAuthorization(logger, publicParameters, walletService),
+	)
+}
 ```
 
 #### Step 6 — Add a wallet wrapper

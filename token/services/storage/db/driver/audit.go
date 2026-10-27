@@ -35,7 +35,11 @@ type AuditTransactionStore interface {
 	// slice returns an empty map without touching the database.
 	GetStatuses(ctx context.Context, txIDs []string) (map[string]TxStatus, error)
 
-	// QueryTransactions returns a list of transactions that match the passed params
+	// QueryTransactions returns a list of transactions that match the passed
+	// params, ordered by stored_at (direction set by params.SearchDirection) and
+	// then by tx_id as a deterministic tie-breaker for rows sharing a stored_at
+	// value, which offset-based pagination needs for a stable row order across
+	// separate queries.
 	QueryTransactions(ctx context.Context, params QueryTransactionsParams, pagination driver.Pagination) (*driver.PageIterator[*TransactionRecord], error)
 
 	// QueryMovements returns a list of movement records
@@ -46,16 +50,36 @@ type AuditTransactionStore interface {
 
 	// GetTokenRequest returns the token request bound to the passed transaction id, if available.
 	// It returns nil without error if the key is not found.
+	//
+	// Verification: a returned payload is a TokenRequestWithMetadata whose
+	// anchor is txID — see integrity.CheckStoredTokenRequest. This is the audit
+	// trail an auditor replays to attribute a transaction, so a payload anchored
+	// to another transaction would attribute the wrong one; it must be reported
+	// as an error rather than returned. Not-found stays nil, nil.
 	GetTokenRequest(ctx context.Context, txID string) ([]byte, error)
 
 	// GetTokenRequests returns the token requests bound to the given tx ids
 	// in a single query. Missing tx ids are absent from the returned map.
 	// Empty input returns an empty map without touching the database.
+	//
+	// Empty map values: a driver that does not omit the key for a zero-length
+	// request column scans it as a nil []byte on some drivers and as an empty
+	// slice on others. Either representation is treated identically to a
+	// missing key — the service layer skips it rather than treating it as a
+	// corrupt record.
+	//
+	// Verification: as for GetTokenRequest, applied to every non-empty entry.
+	// One failing entry fails the whole call.
 	GetTokenRequests(ctx context.Context, txIDs []string) (map[string][]byte, error)
 
 	// AcquireRecoveryLeadership tries to acquire the PostgreSQL advisory lock backing the sweeper leader election.
 	// If acquired is false, leadership was not obtained and the returned lease must be nil.
-	AcquireRecoveryLeadership(ctx context.Context, lockID int64) (RecoveryLeadership, bool, error)
+	AcquireRecoveryLeadership(ctx context.Context) (RecoveryLeadership, bool, error)
+
+	// AcquireLeadership tries to acquire the PostgreSQL advisory lock identified by lockID,
+	// for a leader election independent of the recovery sweep's own lock.
+	// If acquired is false, leadership was not obtained and the returned lease must be nil.
+	AcquireLeadership(ctx context.Context, lockID int64) (RecoveryLeadership, bool, error)
 
 	// ClaimPendingTransactions atomically claims a batch of Pending transactions for recovery processing.
 	// Transactions whose recovery lease expired are eligible again.
@@ -64,10 +88,16 @@ type AuditTransactionStore interface {
 	ClaimPendingTransactions(ctx context.Context, params RecoveryClaimParams) ([]*RecoveryClaim, error)
 
 	// ReleaseRecoveryClaim clears the recovery claim metadata for the given transaction if owned by owner.
-	// The message parameter is stored for audit/debugging purposes.
+	// Unlike the owner-side TransactionStore, an implementation of this interface may
+	// deliberately ignore message rather than persist it: the audit trail's status_message
+	// is authoritative ledger-status text set via SetStatus, and a claim-release message is
+	// generic recovery-loop bookkeeping ("recovered successfully", "recovery failed: …") that
+	// would overwrite it. See postgres.AuditTransactionStore.ReleaseRecoveryClaim.
 	ReleaseRecoveryClaim(ctx context.Context, txID string, owner string, message string) error
 
 	// PrefixedTableName returns the formatted table name for the given logical table name,
 	// following the persistence naming rules of this store.
 	PrefixedTableName(name string) string
+
+	FindingsStore
 }

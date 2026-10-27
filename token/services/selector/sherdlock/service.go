@@ -7,7 +7,6 @@ SPDX-License-Identifier: Apache-2.0
 package sherdlock
 
 import (
-	"sync"
 	"time"
 
 	"github.com/LFDT-Panurus/panurus/token"
@@ -20,9 +19,14 @@ import (
 )
 
 type SelectorService struct {
-	managerLazyCache lazy2.Provider[*token.ManagementService, token.SelectorManager]
-	mu               sync.Mutex
-	managers         []*Manager
+	managerLazyCache lazy2.Provider[*token.ManagementService, *managerEntry]
+}
+
+// managerEntry is the cached manager of one TMS: the manager itself, and what the service hands
+// out for it, which is the manager decorated by the rate limiter when one is configured.
+type managerEntry struct {
+	manager  *Manager
+	selector token.SelectorManager
 }
 
 // NewService returns a SelectorService for the sherdlock driver.
@@ -52,7 +56,6 @@ func NewService(
 		leaseCleanupTickPeriod:       cfg.GetLeaseCleanupTickPeriod(),
 		metrics:                      NewMetrics(metricsProvider),
 		limiter:                      ratelimit.CompileOptions(opts...).Limiter(cfg),
-		onCreate:                     svc.trackManager,
 	}
 	if loader.limiter != nil {
 		logger.Infof("per-wallet token selection rate limiting is enabled")
@@ -67,41 +70,17 @@ func (s *SelectorService) SelectorManager(tms *token.ManagementService) (token.S
 		return nil, errors.Errorf("invalid tms, nil reference")
 	}
 
-	return s.managerLazyCache.Get(tms)
-}
-
-// Shutdown stops all background goroutines for every manager created by this service.
-//
-// It deliberately leaves the rate limiter alone. Shutdown also runs on routine public-parameter
-// reloads (see token.ManagementServiceProvider.Update), after which the service keeps serving
-// managers: resetting the wallet allowances there would let a throttled client wash out its debt
-// by triggering a reload, and a limiter supplied through ratelimit.WithLimiter belongs to the
-// caller in the first place. The built-in limiter runs no goroutines and prunes its own buckets,
-// so there is nothing to leak.
-func (s *SelectorService) Shutdown() {
-	s.mu.Lock()
-	managers := s.managers
-	s.managers = nil
-	s.mu.Unlock()
-
-	for _, m := range managers {
-		if err := m.Stop(); err != nil {
-			logger.Errorf("error shutting down sherdlock service manager: %s", err)
-		}
+	entry, err := s.managerLazyCache.Get(tms)
+	if err != nil {
+		return nil, err
 	}
-}
+	// The cache is keyed by TMS id, so after a public parameters update the TMS gets back the
+	// manager built for the previous parameters. Keep its precision in line with the current ones.
+	if pp := tms.PublicParameters(); pp != nil {
+		entry.manager.SetPrecision(pp.Precision())
+	}
 
-func (s *SelectorService) trackManager(m *Manager) {
-	s.mu.Lock()
-	s.managers = append(s.managers, m)
-	s.mu.Unlock()
-}
-
-func (s *SelectorService) ManagersCount() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	return len(s.managers)
+	return entry.selector, nil
 }
 
 type loader struct {
@@ -114,15 +93,14 @@ type loader struct {
 	metrics                      *Metrics
 	// limiter meters selection requests per wallet. It is nil when rate limiting is
 	// disabled, which is the default, and is shared by every manager the loader builds.
-	limiter  ratelimit.Limiter
-	onCreate func(*Manager)
+	limiter ratelimit.Limiter
 }
 
-func (s *loader) load(tms *token.ManagementService) (token.SelectorManager, error) {
+func (s *loader) load(tms *token.ManagementService) (*managerEntry, error) {
 	return s.loadTMS(tms)
 }
 
-func (s *loader) loadTMS(tms TMS) (token.SelectorManager, error) {
+func (s *loader) loadTMS(tms TMS) (*managerEntry, error) {
 	pp := tms.PublicParameters()
 	if pp == nil {
 		return nil, errors.Errorf("public parameters not set yet for TMS [%s]", tms.ID())
@@ -146,12 +124,8 @@ func (s *loader) loadTMS(tms TMS) (token.SelectorManager, error) {
 		s.leaseCleanupTickPeriod,
 		s.metrics,
 	)
-	if s.onCreate != nil {
-		s.onCreate(mgr)
-	}
-
 	// Decorate returns mgr unchanged when no limiter is configured.
-	return ratelimit.Decorate(mgr, s.limiter, tms.ID().String()), nil
+	return &managerEntry{manager: mgr, selector: ratelimit.Decorate(mgr, s.limiter, tms.ID().String())}, nil
 }
 
 func key(tms *token.ManagementService) string {

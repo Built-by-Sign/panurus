@@ -66,6 +66,10 @@ var IdentityCases = []struct {
 	{"SignerInfoConcurrent", TSignerInfoConcurrent},
 	{"GetExistingSignerInfo", TGetExistingSignerInfo},
 	{"RegisterIdentityDescriptor", TRegisterIdentityDescriptor},
+	// Keep the name short: it is used as a SQL table prefix and PostgreSQL truncates
+	// identifiers at 63 characters, which would collide the store's tables.
+	{"RegisterPartialConflict", TRegisterIdentityDescriptorPartialConflict},
+	{"EmptyIdentityRejected", TEmptyIdentityRejected},
 }
 
 var IdentityNotificationCases = []struct {
@@ -338,7 +342,127 @@ func TRegisterIdentityDescriptor(t *testing.T, db driver.IdentityStore) {
 		Verifier:   verifier,
 	}
 	require.NoError(t, db.RegisterIdentityDescriptor(ctx, descriptor, aliasID))
+	assertIdentityDescriptorRegistered(t, db, id, aliasID, SignerInfo, auditInfo)
+
+	// registering the very same descriptor again must be a no-op success
 	require.NoError(t, db.RegisterIdentityDescriptor(ctx, descriptor, aliasID))
+	assertIdentityDescriptorRegistered(t, db, id, aliasID, SignerInfo, auditInfo)
+}
+
+// TRegisterIdentityDescriptorPartialConflict covers the retry-after-partial-write scenarios: only
+// some of the rows a descriptor registration writes are already present, as would be left behind by
+// a crash in the middle of a previous attempt. All those writes share one transaction, so a
+// duplicate key on any of them must neither fail the registration nor stop the still-missing rows
+// from being written.
+func TRegisterIdentityDescriptorPartialConflict(t *testing.T, db driver.IdentityStore) {
+	t.Helper()
+	ctx := t.Context()
+	auditInfo := []byte("audit_info")
+	signerInfo := []byte("signer_info")
+
+	descriptorFor := func(id []byte) *idriver.IdentityDescriptor {
+		return &idriver.IdentityDescriptor{
+			Identity:   id,
+			AuditInfo:  auditInfo,
+			Signer:     &mock.Signer{},
+			SignerInfo: signerInfo,
+			Verifier:   &mock.Verifier{},
+		}
+	}
+
+	// The audit info of the identity is already there, everything else is missing. On PostgreSQL
+	// this is the case where the duplicate key aborts the shared transaction and, unless it is
+	// isolated, makes the following alias writes fail with a generic error.
+	id, alias := []byte("bob"), []byte("banana")
+	require.NoError(t, db.StoreIdentityData(ctx, id, auditInfo, nil, nil))
+	require.NoError(t, db.RegisterIdentityDescriptor(ctx, descriptorFor(id), alias))
+	assertIdentityDescriptorRegistered(t, db, id, alias, signerInfo, auditInfo)
+
+	// The signer info of the identity is already there, everything else is missing.
+	id, alias = []byte("carol"), []byte("cherry")
+	require.NoError(t, db.StoreSignerInfo(ctx, id, signerInfo))
+	require.NoError(t, db.RegisterIdentityDescriptor(ctx, descriptorFor(id), alias))
+	assertIdentityDescriptorRegistered(t, db, id, alias, signerInfo, auditInfo)
+
+	// Only the alias' rows are already there.
+	id, alias = []byte("dave"), []byte("date")
+	require.NoError(t, db.StoreSignerInfo(ctx, alias, signerInfo))
+	require.NoError(t, db.StoreIdentityData(ctx, alias, auditInfo, nil, nil))
+	require.NoError(t, db.RegisterIdentityDescriptor(ctx, descriptorFor(id), alias))
+	assertIdentityDescriptorRegistered(t, db, id, alias, signerInfo, auditInfo)
+
+	// Both the identity's signer info and the alias' audit info are already there.
+	id, alias = []byte("erin"), []byte("elderberry")
+	require.NoError(t, db.StoreSignerInfo(ctx, id, signerInfo))
+	require.NoError(t, db.StoreIdentityData(ctx, alias, auditInfo, nil, nil))
+	require.NoError(t, db.RegisterIdentityDescriptor(ctx, descriptorFor(id), alias))
+	assertIdentityDescriptorRegistered(t, db, id, alias, signerInfo, auditInfo)
+}
+
+// assertIdentityDescriptorRegistered checks that both the identity and its alias carry the expected
+// signer info and audit info. GetSignerInfo is asserted on as well as SignerInfoExists because the
+// former bypasses the store's in-memory caches, which would otherwise report a row as present even
+// when the registration never wrote it.
+func assertIdentityDescriptorRegistered(t *testing.T, db driver.IdentityStore, id, alias, signerInfo, auditInfo []byte) {
+	t.Helper()
+	ctx := t.Context()
+	for _, identity := range [][]byte{id, alias} {
+		exists, err := db.SignerInfoExists(ctx, identity)
+		require.NoError(t, err)
+		assert.True(t, exists, "signer info missing for [%s]", identity)
+
+		storedSignerInfo, err := db.GetSignerInfo(ctx, identity)
+		require.NoError(t, err, "failed reading signer info for [%s]", identity)
+		assert.Equal(t, signerInfo, storedSignerInfo, "signer info mismatch for [%s]", identity)
+
+		storedAuditInfo, err := db.GetAuditInfo(ctx, identity)
+		require.NoError(t, err)
+		assert.Equal(t, auditInfo, storedAuditInfo, "audit info mismatch for [%s]", identity)
+	}
+}
+
+// TEmptyIdentityRejected holds both backends to the same spec on empty
+// identities. Identity rows are keyed by unique id, and the unique id of the
+// empty identity is a fixed string rather than a hash, so every empty identity
+// shares one key: a store that accepted them would let one caller's audit info
+// or signer info be read back by any other empty-identity lookup. Every write
+// and read path must therefore refuse an empty identity outright — except the
+// existence queries over a batch, GetExistingSignerInfo and SignerInfoExists,
+// which exclude it from the lookup and report it as not existing — and the
+// well-known key must stay unoccupied.
+func TEmptyIdentityRejected(t *testing.T, db driver.IdentityStore) {
+	t.Helper()
+	ctx := t.Context()
+	empty := []byte(nil)
+	auditInfo := []byte("audit_info")
+
+	require.Error(t, db.StoreIdentityData(ctx, empty, auditInfo, []byte("tok_meta"), []byte("tok_meta_audit")))
+	require.Error(t, db.StoreIdentityData(ctx, []byte{}, auditInfo, []byte("tok_meta"), []byte("tok_meta_audit")))
+	require.Error(t, db.StoreSignerInfo(ctx, empty, []byte("signer_info")))
+
+	_, err := db.GetAuditInfo(ctx, empty)
+	require.Error(t, err)
+	_, _, err = db.GetTokenInfo(ctx, empty)
+	require.Error(t, err)
+	_, err = db.GetSignerInfo(ctx, empty)
+	require.Error(t, err)
+
+	require.Error(t, db.RegisterIdentityDescriptor(ctx, &idriver.IdentityDescriptor{
+		Identity:   empty,
+		AuditInfo:  auditInfo,
+		Signer:     &mock.Signer{},
+		SignerInfo: []byte("signer_info"),
+		Verifier:   &mock.Verifier{},
+	}, nil))
+
+	// the shared key is never consulted, so it reads as unoccupied
+	exists, err := db.SignerInfoExists(ctx, empty)
+	require.NoError(t, err)
+	assert.False(t, exists, "the empty-identity key must stay unoccupied")
+
+	existing, err := db.GetExistingSignerInfo(ctx, empty)
+	require.NoError(t, err)
+	assert.Empty(t, existing, "an empty identity must never be reported as having signer info")
 }
 
 func TIdentityNotifier(t *testing.T, db driver.IdentityStore) {

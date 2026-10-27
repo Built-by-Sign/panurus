@@ -16,7 +16,9 @@ import (
 	"github.com/LFDT-Panurus/panurus/token"
 	commondrivermock "github.com/LFDT-Panurus/panurus/token/core/common/driver/mock"
 	"github.com/LFDT-Panurus/panurus/token/core/common/metrics"
+	"github.com/LFDT-Panurus/panurus/token/driver"
 	drivermock "github.com/LFDT-Panurus/panurus/token/driver/mock"
+	"github.com/LFDT-Panurus/panurus/token/driver/protos-go/v1/request"
 	tokenmock "github.com/LFDT-Panurus/panurus/token/mock"
 	"github.com/LFDT-Panurus/panurus/token/services/auditor"
 	auditmock "github.com/LFDT-Panurus/panurus/token/services/auditor/mock"
@@ -25,6 +27,7 @@ import (
 	"github.com/LFDT-Panurus/panurus/token/services/storage/auditdb"
 	auditdbmock "github.com/LFDT-Panurus/panurus/token/services/storage/auditdb/mock"
 	dbdriver "github.com/LFDT-Panurus/panurus/token/services/storage/db/driver"
+	"github.com/LFDT-Panurus/panurus/token/services/storage/integrity"
 	"github.com/LFDT-Panurus/panurus/token/services/tokens"
 	depmock "github.com/LFDT-Panurus/panurus/token/services/ttx/dep/mock"
 	token2 "github.com/LFDT-Panurus/panurus/token/token"
@@ -32,6 +35,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/trace/noop"
+	"google.golang.org/protobuf/proto"
 )
 
 // fakeServiceProvider is a simple test stub implementing token.ServiceProvider.
@@ -59,6 +63,7 @@ func newTestManagementService(t *testing.T) *token.ManagementService {
 	mockPP := &drivermock.PublicParameters{}
 	mockPP.PrecisionReturns(64)
 	mockPPM.PublicParametersReturns(mockPP)
+	mockPPM.PublicParamsHashReturns([]byte("pp-hash"))
 
 	mockTMS.PublicParamsManagerReturns(mockPPM)
 	mockTMS.TokensServiceReturns(&drivermock.TokensService{})
@@ -263,14 +268,51 @@ func TestService_GetStatus_Error(t *testing.T) {
 	assert.ErrorIs(t, err, expectedErr)
 }
 
+// storedTokenRequest builds the wire format the audit store holds: a
+// TokenRequestWithMetadata anchored to the passed anchor.
+func storedTokenRequest(t *testing.T, anchor string) []byte {
+	t.Helper()
+	raw, err := proto.Marshal(&request.TokenRequestWithMetadata{
+		Version: uint32(driver.ProtocolV1),
+		Anchor:  anchor,
+		Request: &request.TokenRequest{Version: uint32(driver.ProtocolV1)},
+	})
+	require.NoError(t, err)
+
+	return raw
+}
+
 func TestService_GetTokenRequest_Success(t *testing.T) {
-	data := []byte("raw-token-request")
+	data := storedTokenRequest(t, "tx-tok")
 	fakeStore := newFakeStore()
 	fakeStore.GetTokenRequestReturns(data, nil)
 	svc := newTestService(t, newTestStoreService(t, fakeStore), nil)
 	got, err := svc.GetTokenRequest(context.Background(), "tx-tok")
 	require.NoError(t, err)
 	assert.Equal(t, data, got)
+}
+
+// TestService_GetTokenRequest_AnchorMismatch checks that a stored request
+// belonging to another transaction is reported as an error rather than returned
+// as this transaction's request.
+func TestService_GetTokenRequest_AnchorMismatch(t *testing.T) {
+	fakeStore := newFakeStore()
+	fakeStore.GetTokenRequestReturns(storedTokenRequest(t, "tx-other"), nil)
+	svc := newTestService(t, newTestStoreService(t, fakeStore), nil)
+	got, err := svc.GetTokenRequest(context.Background(), "tx-tok")
+	require.ErrorIs(t, err, integrity.ErrAnchorMismatch)
+	assert.Nil(t, got)
+}
+
+// TestService_GetTokenRequest_Malformed checks that bytes that are not a token
+// request at all are refused rather than handed to the caller.
+func TestService_GetTokenRequest_Malformed(t *testing.T) {
+	fakeStore := newFakeStore()
+	fakeStore.GetTokenRequestReturns([]byte("raw-token-request"), nil)
+	svc := newTestService(t, newTestStoreService(t, fakeStore), nil)
+	got, err := svc.GetTokenRequest(context.Background(), "tx-tok")
+	require.ErrorIs(t, err, integrity.ErrMalformedTokenRequest)
+	assert.Nil(t, got)
 }
 
 func TestService_GetTokenRequest_Error(t *testing.T) {
@@ -458,6 +500,44 @@ func TestService_Append_Success(t *testing.T) {
 
 	err := svc.Append(context.Background(), tx)
 	require.NoError(t, err)
+}
+
+// TestService_Append_FinalityListenerDoesNotReleaseSelectionLocks pins the auditor's wiring of
+// the finality listener: an auditor inspects and records transactions assembled and spent
+// elsewhere, so it never holds token-selection locks for them. Its listener is therefore wired
+// with finality.NewNoSelectorManagerProvider, and a finalized transaction costs no selector
+// manager lookup, no Unlock that could only ever match zero rows, and - on a TMS with no usable
+// selector manager - no warning logged per finalized transaction. See #2395 mechanism 4, whose
+// release belongs to the spending node alone.
+func TestService_Append_FinalityListenerDoesNotReleaseSelectionLocks(t *testing.T) {
+	fakeNet := &auditmock.Network{}
+	netProvider := &auditmock.NetworkProvider{}
+	netProvider.GetNetworkReturns(network.NewNetwork(fakeNet, nil), nil)
+
+	tmsProv := newTestTMSProvider(t)
+	svc := auditor.NewService(
+		token.TMSID{}, netProvider,
+		newTestStoreService(t, newFakeStore()),
+		nil, tmsProv, noop.NewTracerProvider().Tracer(""), nil, nil, nil,
+	)
+	tx := &auditmock.Transaction{}
+	tx.IDReturns("tx-auditor-no-release")
+	tx.NetworkReturns("testnet")
+	tx.ChannelReturns("testch")
+	tx.NamespaceReturns("testns")
+	tx.RequestReturns(token.NewRequest(newTestManagementService(t), token.RequestAnchor("tx-auditor-no-release")))
+
+	require.NoError(t, svc.Append(context.Background(), tx))
+	require.Equal(t, 1, fakeNet.AddFinalityListenerCallCount())
+	_, _, listener := fakeNet.AddFinalityListenerArgsForCall(0)
+
+	// network.Invalid is terminal and does not go through the token-request hasher, so the TMS
+	// would be resolved only to reach a selector manager. It must not be.
+	before := tmsProv.TokenManagementServiceCallCount()
+	listener.OnStatus(context.Background(), tx.ID(), network.Invalid, "rejected", nil)
+
+	require.Equal(t, before, tmsProv.TokenManagementServiceCallCount(),
+		"an auditor's finality listener must not resolve a selector manager: it holds no selection locks to release")
 }
 
 func TestService_Append_AddFinalityListenerError(t *testing.T) {

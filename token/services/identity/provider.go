@@ -14,8 +14,9 @@ import (
 	"github.com/LFDT-Panurus/panurus/token/driver"
 	idriver "github.com/LFDT-Panurus/panurus/token/services/identity/driver"
 	"github.com/LFDT-Panurus/panurus/token/services/logging"
+	"github.com/LFDT-Panurus/panurus/token/services/storage/integrity"
+	cache2 "github.com/LFDT-Panurus/panurus/token/services/utils/cache"
 	"github.com/hyperledger-labs/fabric-smart-client/pkg/utils/errors"
-	"github.com/hyperledger-labs/fabric-smart-client/platform/common/utils/cache/secondcache"
 	"github.com/hyperledger-labs/fabric-smart-client/platform/common/utils/collections"
 	"go.uber.org/zap/zapcore"
 )
@@ -111,7 +112,7 @@ func NewProvider(
 		enrollmentIDUnmarshaler: enrollmentIDUnmarshaler,
 		deserializer:            deserializer,
 		storage:                 storage,
-		signers:                 secondcache.NewTyped[*SignerEntry](50),
+		signers:                 cache2.NewSecondChanceCache[*SignerEntry](50, 1),
 		metrics:                 m,
 	}
 }
@@ -124,7 +125,20 @@ func (p *Provider) SetSignerRouter(router *SignerRouter) {
 }
 
 // RegisterRecipientData stores the passed recipient data in the configured storage.
+//
+// Verification: the identity must be non-empty. Identities are keyed by their
+// unique id, and the unique id of an empty identity is a fixed string rather
+// than a hash of any content, so every empty identity collides on one key: the
+// audit info registered for one of them is what a later lookup for any other
+// returns. See docs/security/store_integrity_verification.md.
 func (p *Provider) RegisterRecipientData(ctx context.Context, data *driver.RecipientData) error {
+	if data == nil {
+		return errors.New("cannot register nil recipient data")
+	}
+	if err := integrity.CheckIdentity(data.Identity); err != nil {
+		return errors.WithMessage(err, "refusing to register recipient data")
+	}
+
 	return p.storage.StoreIdentityData(ctx, data.Identity, data.AuditInfo, data.TokenMetadata, data.TokenMetadataAuditInfo)
 }
 
@@ -148,15 +162,28 @@ func (p *Provider) RegisterSigner(ctx context.Context, identity driver.Identity,
 // Each identity is resolved via the signer cache and configured storage.
 // There is no secondary "is me" cache: a real cache would need careful handling for
 // single-use identities (for example Idemix nyms) and is intentionally omitted here.
-func (p *Provider) AreMe(ctx context.Context, identities ...driver.Identity) []string {
+// A non-nil error means ownership could not be determined for at least one identity; in that
+// case the returned slice is nil and no identity may be treated as checked. The cache-only
+// partial is deliberately not returned: a caller must not mistake "couldn't check" for
+// "confirmed not mine". The error distinguishes a caller-driven abort (a cancelled or
+// deadline-exceeded context — errors.Is context.Canceled / context.DeadlineExceeded) from a
+// genuine storage failure, so a cancellation is not misread as a broken backend.
+func (p *Provider) AreMe(ctx context.Context, identities ...driver.Identity) ([]string, error) {
 	p.Logger.DebugfContext(ctx, "identity [%s] is me?", identities)
 
 	return p.areMe(ctx, identities...)
 }
 
-// IsMe returns true if a signer was ever registered for the passed identity
-func (p *Provider) IsMe(ctx context.Context, identity driver.Identity) bool {
-	return len(p.AreMe(ctx, identity)) > 0
+// IsMe returns true if a signer was ever registered for the passed identity.
+// A non-nil error means ownership could not be determined; the boolean must be ignored in
+// that case rather than treated as an authoritative "not mine".
+func (p *Provider) IsMe(ctx context.Context, identity driver.Identity) (bool, error) {
+	me, err := p.AreMe(ctx, identity)
+	if err != nil {
+		return false, err
+	}
+
+	return len(me) > 0, nil
 }
 
 // GetAuditInfo returns the audit information associated to the passed identity, nil otherwise.
@@ -234,7 +261,21 @@ func (p *Provider) RollbackPartialRecipientRegistration(ctx context.Context, id 
 
 // RegisterIdentityDescriptor stores the given identity descriptor in the configured storage.
 // If alias is not nil, the alias can be used as an alternative to `idriver.IdentityDescriptor#Identity`.
+//
+// Verification: the descriptor's identity must be non-empty. This is checked
+// here rather than only in the storage layer because an ephemeral descriptor
+// never reaches storage and yet still populates the signer cache, which is
+// keyed the same way — an empty identity would install a signer under the key
+// shared by every empty identity. See
+// docs/security/store_integrity_verification.md.
 func (p *Provider) RegisterIdentityDescriptor(ctx context.Context, identityDescriptor *idriver.IdentityDescriptor, alias driver.Identity) error {
+	if identityDescriptor == nil {
+		return errors.New("cannot register nil identity descriptor")
+	}
+	if err := integrity.CheckIdentity(identityDescriptor.Identity); err != nil {
+		return errors.WithMessage(err, "refusing to register identity descriptor")
+	}
+
 	// register in the Storage
 	if !identityDescriptor.Ephemeral {
 		if err := p.storage.RegisterIdentityDescriptor(ctx, identityDescriptor, alias); err != nil {
@@ -250,12 +291,8 @@ func (p *Provider) RegisterIdentityDescriptor(ctx context.Context, identityDescr
 	return nil
 }
 
-func (p *Provider) areMe(ctx context.Context, identities ...driver.Identity) []string {
+func (p *Provider) areMe(ctx context.Context, identities ...driver.Identity) ([]string, error) {
 	p.Logger.DebugfContext(ctx, "is me [%s]?", identities)
-	idHashes := make([]string, len(identities))
-	for i, id := range identities {
-		idHashes[i] = id.UniqueID()
-	}
 
 	result := collections.NewSet[string]()
 	notFound := make([]driver.Identity, 0)
@@ -271,19 +308,30 @@ func (p *Provider) areMe(ctx context.Context, identities ...driver.Identity) []s
 	}
 
 	if len(notFound) == 0 {
-		return result.ToSlice()
+		return result.ToSlice(), nil
 	}
 
-	// check Storage
+	// check Storage. A failure here must not be flattened into a negative answer: the
+	// identities we could not check are exactly the ones in notFound, and silently dropping
+	// them would report an owned identity as not-owned. Return (nil, err) so callers key off
+	// the error and cannot mistake the cache-only partial for a "confirmed not mine".
 	found, err := p.storage.GetExistingSignerInfo(ctx, notFound...)
 	if err != nil {
-		p.Logger.Errorf("failed checking if a signer exists [%s]", err)
+		// Distinguish "we gave up" from "storage is broken". A context cancellation or
+		// deadline is the caller's own doing (it tore the request down mid-check) and says
+		// nothing about storage health, so it must not read as a backend failure in logs or
+		// to a circuit breaker; a genuine lookup failure is the infrastructure problem worth
+		// surfacing and retrying. Both are non-authoritative — the slice is nil either way —
+		// and the underlying context error stays errors.Is-checkable through the wrap.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, errors.Wrapf(err, "gave up checking if a signer exists for [%d] identities", len(notFound))
+		}
 
-		return result.ToSlice()
+		return nil, errors.Wrapf(err, "storage failed checking if a signer exists")
 	}
 	result.Add(found...)
 
-	return result.ToSlice()
+	return result.ToSlice(), nil
 }
 
 func (p *Provider) getSigner(ctx context.Context, identity driver.Identity, idHash string) (driver.Signer, error) {

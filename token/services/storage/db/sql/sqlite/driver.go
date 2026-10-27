@@ -10,8 +10,8 @@ import (
 	"strings"
 
 	"github.com/LFDT-Panurus/panurus/token/services/logging"
-	"github.com/hyperledger-labs/fabric-smart-client/platform/common/utils"
-	"github.com/hyperledger-labs/fabric-smart-client/platform/common/utils/cache/secondcache"
+	"github.com/LFDT-Panurus/panurus/token/services/utils"
+	cache2 "github.com/LFDT-Panurus/panurus/token/services/utils/cache"
 	"github.com/hyperledger-labs/fabric-smart-client/platform/common/utils/lazy"
 	driver2 "github.com/hyperledger-labs/fabric-smart-client/platform/view/services/storage/driver"
 	"github.com/hyperledger-labs/fabric-smart-client/platform/view/services/storage/driver/common"
@@ -53,10 +53,11 @@ func NewDriver(config driver3.Config) *Driver {
 }
 
 func NewDriverWithDbProvider(config driver3.Config, dbProvider fscSqlite.DbProvider) *Driver {
-	tableNamesConfig, err := common2.LoadTableNamesConfig(config)
+	storageConfig, err := common2.LoadStorageConfig(config)
 	if err != nil {
-		logger.Warnf("failed to load table name overrides: %v — using defaults", err)
+		logger.Warnf("failed to load storage config: %v — using defaults", err)
 	}
+	tableNamesConfig := storageConfig.TableNames
 
 	d := &Driver{
 		cp:               fscSqlite.NewConfigProvider(common.NewConfig(config)),
@@ -98,10 +99,10 @@ func newIdentityStoreProvider(dbProvider fscSqlite.DbProvider, tableNamesConfig 
 
 		p, err := common2.NewIdentityStoreWithNotifier(
 			dbs.ReadDB,
-			dbs.WriteDB,
+			NewBusyRetryWriteDB(dbs.WriteDB),
 			tableNames,
-			secondcache.NewTyped[bool](5000),
-			secondcache.NewTyped[[]byte](5000),
+			cache2.NewSecondChanceCache[bool](5000, 1),
+			cache2.NewSecondChanceCache[[]byte](5000, 1),
 			NewConditionInterpreter(),
 			&fscSqlite.ErrorMapper{},
 			nil,

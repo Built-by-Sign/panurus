@@ -30,15 +30,16 @@ type networkService interface {
 // TTXRecoveryHandler implements transaction recovery by directly querying transaction status
 // and applying finality logic synchronously
 type TTXRecoveryHandler struct {
-	logger        logging.Logger
-	network       networkService
-	namespace     string
-	hasher        tokenRequestHasher
-	tmsID         token.TMSID
-	transactionDB transactionDB
-	tokens        tokensService
-	tracer        trace.Tracer
-	metrics       *Metrics
+	logger                  logging.Logger
+	network                 networkService
+	namespace               string
+	hasher                  tokenRequestHasher
+	tmsID                   token.TMSID
+	transactionDB           transactionDB
+	tokens                  tokensService
+	selectorManagerProvider selectorManagerProvider
+	tracer                  trace.Tracer
+	metrics                 *Metrics
 }
 
 // NewTTXRecoveryHandler creates a new recovery handler with all dependencies needed
@@ -51,19 +52,21 @@ func NewTTXRecoveryHandler(
 	tmsID token.TMSID,
 	transactionDB transactionDB,
 	tokens tokensService,
+	selectorManagerProvider selectorManagerProvider,
 	tracer trace.Tracer,
 	metricsProvider metrics.Provider,
 ) *TTXRecoveryHandler {
 	return &TTXRecoveryHandler{
-		logger:        logger,
-		network:       network,
-		namespace:     namespace,
-		hasher:        hasher,
-		tmsID:         tmsID,
-		transactionDB: transactionDB,
-		tokens:        tokens,
-		tracer:        tracer,
-		metrics:       NewMetrics(metricsProvider),
+		logger:                  logger,
+		network:                 network,
+		namespace:               namespace,
+		hasher:                  hasher,
+		tmsID:                   tmsID,
+		transactionDB:           transactionDB,
+		tokens:                  tokens,
+		selectorManagerProvider: selectorManagerProvider,
+		tracer:                  tracer,
+		metrics:                 NewMetrics(metricsProvider),
 	}
 }
 
@@ -84,6 +87,51 @@ func (h *TTXRecoveryHandler) Recover(ctx context.Context, txID string) error {
 	return h.applyFinalityLogic(ctx, txID, status, message, tokenRequestHash)
 }
 
+// handleValidStatus processes a network.Valid status change for txID: it loads (or reuses the
+// cached) token request, checks its hash against tokenRequestHash, and commits it. It returns
+// the resulting tx status (Confirmed, or Deleted on a hash mismatch) and status message.
+func (h *TTXRecoveryHandler) handleValidStatus(ctx context.Context, txID, message string, tokenRequestHash []byte) (storage.TxStatus, string, error) {
+	txStatus := storage.Confirmed
+	h.logger.DebugfContext(ctx, "transaction [%s] is valid, processing token request", txID)
+
+	// Get token request
+	tr, msgToSign := h.tokens.GetCachedTokenRequest(txID)
+	if tr == nil {
+		// Load from database
+		tokenRequestRaw, err := h.transactionDB.GetTokenRequest(ctx, txID)
+		if err != nil {
+			h.logger.ErrorfContext(ctx, "failed retrieving token request [%s]: [%s]", txID, err)
+
+			return txStatus, message, errors.Wrapf(err, "failed retrieving token request [%s]", txID)
+		}
+
+		h.logger.DebugfContext(ctx, "loaded token request from database for [%s]", txID)
+
+		// Process token request using the hasher
+		tr, msgToSign, err = h.hasher.ProcessTokenRequest(ctx, tokenRequestRaw)
+		if err != nil {
+			return txStatus, message, errors.Wrapf(err, "failed to process token request [%s]", txID)
+		}
+	}
+
+	// Verify token request hash
+	h.logger.DebugfContext(ctx, "verifying token request hash for [%s]", txID)
+	if err := h.checkTokenRequest(txID, msgToSign, tokenRequestHash); err != nil {
+		h.logger.ErrorfContext(ctx, "tx [%s], %s", txID, err)
+		h.metrics.HashMismatches.Add(1)
+
+		return storage.Deleted, err.Error(), nil
+	}
+
+	if err := Commit(ctx, h.logger, h.tokens, h.transactionDB, txID, tr); err != nil {
+		h.logger.ErrorfContext(ctx, "tx [%s], %s", txID, err)
+
+		return txStatus, message, err
+	}
+
+	return txStatus, message, nil
+}
+
 // applyFinalityLogic implements the same logic as the finality listener's runOnStatus method
 func (h *TTXRecoveryHandler) applyFinalityLogic(ctx context.Context, txID string, status int, message string, tokenRequestHash []byte) error {
 	h.logger.DebugfContext(ctx, "applying finality logic for tx [%s] with status [%d]", txID, status)
@@ -91,42 +139,10 @@ func (h *TTXRecoveryHandler) applyFinalityLogic(ctx context.Context, txID string
 	var txStatus storage.TxStatus
 	switch status {
 	case network.Valid:
-		txStatus = storage.Confirmed
-		h.logger.DebugfContext(ctx, "transaction [%s] is valid, processing token request", txID)
-
-		// Get token request
-		tr, msgToSign := h.tokens.GetCachedTokenRequest(txID)
-		if tr == nil {
-			// Load from database
-			tokenRequestRaw, err := h.transactionDB.GetTokenRequest(ctx, txID)
-			if err != nil {
-				h.logger.ErrorfContext(ctx, "failed retrieving token request [%s]: [%s]", txID, err)
-
-				return errors.Wrapf(err, "failed retrieving token request [%s]", txID)
-			}
-
-			h.logger.DebugfContext(ctx, "loaded token request from database for [%s]", txID)
-
-			// Process token request using the hasher
-			tr, msgToSign, err = h.hasher.ProcessTokenRequest(ctx, tokenRequestRaw)
-			if err != nil {
-				return errors.Wrapf(err, "failed to process token request [%s]", txID)
-			}
-		}
-
-		// Verify token request hash
-		h.logger.DebugfContext(ctx, "verifying token request hash for [%s]", txID)
-		if err := h.checkTokenRequest(txID, msgToSign, tokenRequestHash); err != nil {
-			h.logger.ErrorfContext(ctx, "tx [%s], %s", txID, err)
-			h.metrics.HashMismatches.Add(1)
-			txStatus = storage.Deleted
-			message = err.Error()
-		} else {
-			if err := Commit(ctx, h.logger, h.tokens, h.transactionDB, txID, tr); err != nil {
-				h.logger.ErrorfContext(ctx, "tx [%s], %s", txID, err)
-
-				return err
-			}
+		var err error
+		txStatus, message, err = h.handleValidStatus(ctx, txID, message, tokenRequestHash)
+		if err != nil {
+			return err
 		}
 
 	case network.Invalid:
@@ -158,6 +174,7 @@ func (h *TTXRecoveryHandler) applyFinalityLogic(ctx context.Context, txID string
 	} else {
 		h.metrics.DeletedTransactions.Add(1)
 	}
+	releaseLocks(ctx, h.logger, h.selectorManagerProvider, txID)
 
 	h.logger.DebugfContext(ctx, "successfully recovered transaction [%s] with status [%s]", txID, txStatus)
 

@@ -54,11 +54,28 @@ This store serves as the authoritative registry for all tokens (UTXOs) known to 
 
 ### Wallet & Identity Store (WalletDB / IdentityDB)
 Manages the cryptographic identities and logical wallet groupings used by the node.
+These two stores also have a non-SQL implementation, see [KVS-Backed Identity and Wallet
+Stores](./storage/kvs.md).
 
 *   **Wallets**: Maps user identities to logical wallets and specific roles (e.g., Owner, Auditor).
 *   **IdentityConfigurations**: Persists long-term configuration data for various identity types (e.g., Idemix, X.509).
 *   **IdentityInfo**: Stores sensitive identity-related data, including audit information and PII required for transaction processing.
 *   **IdentitySigners**: Tracks which identities have locally available signing keys and their associated metadata.
+
+#### Idempotent identity registration
+
+`RegisterIdentityDescriptor` writes up to four rows in a single transaction: the signer info and
+the audit info of the identity, plus the same two for its alias. The operation is **idempotent and
+safe to retry**. Registering the same descriptor twice succeeds without error, and a registration
+that was only partially persisted — for example because a previous attempt was interrupted by a
+crash — is completed by the retry rather than rejected.
+
+Each of those inserts is individually idempotent (a duplicate key means "already registered"), but
+they share one transaction, so each one is isolated by its own `SAVEPOINT`. Without it, the first
+duplicate key would abort the whole transaction on PostgreSQL and every following statement would
+fail with a generic `current transaction is aborted` error (`SQLSTATE 25P02`) that no longer
+identifies itself as a unique-key violation. Rolling back to the savepoint clears that state, so
+the rows that are still missing are written and only genuine errors abort the registration.
 
 ### Generic Store
 *   **KeyStore**: A secure, generic key-value store used for persisting various cryptographic materials and small sensitive states. The keystore uses identifiers that are expected to be the hexadecimal representation of the key's Subject Key Identifier (SKI). This convention is relied upon by other packages, particularly for operations like keystore cleanup where SKIs are derived from owner identities to locate and manage keys.
@@ -220,6 +237,20 @@ The Storage Service follows a "Finality-Driven" update strategy. While transacti
 The `TokenDB` and `Movements` tables are typically updated only when the **Network Service** confirms that a transaction has reached finality on the ledger. 
 This ensures that the local view of the "Token Landscape" always reflects the ground truth of the distributed ledger.
 
+## Integrity Verification
+
+A store does not persist whatever it is handed. Before a high-value payload is written, and again
+before it is handed back, the store applies a set of structural checks — that a token request is
+anchored to the transaction id it is filed under, that public parameters hash to the hash they are
+addressed by, that a hash-addressed identity row belongs to the identity that was asked for. The
+checks are unconditional and fail-closed, and the ones a store *does not* perform are the caller's
+documented obligation rather than an unstated gap.
+
+Each store method that applies a check names it in a `Verification:` clause in its Godoc, and the
+checks themselves live in `token/services/storage/integrity`. For the full per-asset-class posture —
+including what is deliberately not checked and why — see
+[**Store Integrity Verification**](../security/store_integrity_verification.md).
+
 ## Transaction Recovery Service
 
 The Storage Service includes a **Transaction Recovery Service** that provides the core recovery mechanism for handling pending transactions that may have lost their finality listeners due to node restarts, network interruptions, or other failures.
@@ -242,7 +273,7 @@ It uses a distributed locking mechanism (PostgreSQL advisory locks) to ensure on
 - **Multi-Database Support**:
   - **PostgreSQL**: Recommended for production multi-instance deployments. Uses advisory locks for distributed coordination and leader election
   - **SQLite**: Supported for single-node deployments and development. Handles node restarts gracefully but is not designed for multi-replica scenarios
-- **Configurable Behavior**: Recovery parameters can be tuned via configuration (see [Configuration](../configuration.md), Section `Optional: token.tms.<name>.services.network.fabric.recovery`)
+- **Configurable Behavior**: Recovery parameters can be tuned via configuration (see [Configuration](../configuration.md), Section `Optional: token.tms.<name>.services.network.recovery`)
 
 ### Recovery Process
 
@@ -288,7 +319,7 @@ The recovery service supports both PostgreSQL and SQLite backends, with differen
 
 ### Configuration
 
-Recovery behavior is controlled by the `token.tms.<name>.services.network.fabric.recovery` configuration section. 
+Recovery behavior is controlled by the `token.tms.<name>.services.network.recovery` configuration section. This key was formerly `services.network.fabric.recovery`, which is no longer read. 
 
 ## Keystore Cleanup Service
 
@@ -340,4 +371,92 @@ The cleanup service supports both PostgreSQL and SQLite backends, with different
 
 Cleanup behavior is controlled by the configuration section. See the [Configuration Guide](../configuration.md) for detailed parameter descriptions and tuning recommendations.
 
-See the [Configuration Guide](../configuration.md), Section `Optional: token.tms.<name>.services.network.fabric.recovery`, for detailed parameter descriptions and tuning recommendations.
+See the [Configuration Guide](../configuration.md), Section `Optional: token.tms.<name>.services.network.recovery`, for detailed parameter descriptions and tuning recommendations.
+
+## Storage API Limits
+
+The storage service limits its writes and reads so one huge write or one runaway
+query can't exhaust the database (issue #1630, CWE-400 / CWE-770). The limits are
+enforced by a single, stackable **guard** decorator layer
+(`token/services/storage/db/guard/`) applied once at the multiplexed driver
+(`token/services/storage/db/multiplexed/driver.go`) as each store is created, so
+every backing driver (SQLite, PostgreSQL) and every store is covered by the same
+mechanism. The decorators embed the store interfaces and override only the methods
+that need a check, delegating everything else — new layers (metrics, tracing) can be
+stacked the same way, with the concrete SQL store at the bottom.
+
+A single `Policy` (`MaxPayloadSize`, `MaxPageSize`) drives every check. It is loaded
+once from configuration; absent keys fall back to the built-in defaults, and an
+explicit `0` disables that check.
+
+**Write size limit.** Writes whose serialised payload exceeds `maxPayloadSize`
+(default 4 MiB; `0` disables) are rejected before reaching the database. Covered
+writes include the transaction store's `AddTokenRequest` / `AddTransaction` /
+`AddMovement` / `AddTransactionEndorsementAck`, the token store's `StoreToken` /
+`StorePublicParams` / `StoreCertifications`, the endorser store's
+`AddValidationRecord`, the identity store's `StoreIdentityData` / `StoreSignerInfo` /
+`RegisterIdentityDescriptor` / `AddConfiguration`, and the wallet store's
+`StoreIdentity`.
+
+**Read size limit.** `maxPageSize` (default 1000) bounds the paginated reads —
+currently `QueryTransactions` on the owner and audit transaction stores. Those
+reads require a bounded page: `nil` and `pagination.None()` are rejected, as is a
+page size larger than `maxPageSize`. Callers page through the full result set.
+
+Rejecting the request is only a safe way to bound a read when the caller has a way
+to comply, so the cap is applied exactly to the reads that accept a pagination
+argument. Streaming iterator reads are **not** row-capped:
+
+- The token store's unspent/spendable/unsupported iterators, the endorser store's
+  `QueryValidations`, the transaction store's `QueryTokenRequests`, and the identity
+  store's `IteratorConfigurations` all take no page size or cursor, and their
+  consumers drain them in full — the selectors and integrity checks for the token
+  iterators, and `LocalMembership.storedIdentityConfigurations` on the identity
+  `Load` path for `IteratorConfigurations`. Capping any of them would turn a large
+  but legitimate dataset into a hard failure that the caller cannot page around.
+- `QueryMovements` is uncapped for a second reason: it feeds balance totals, so
+  dropping rows would quietly return wrong balances. It is already narrowed by its
+  required filters.
+
+You can override the limits in configuration (`token.storage.maxPayloadSize` /
+`token.storage.maxPageSize`) — see the [Configuration Guide](../configuration.md).
+
+**Not yet covered (tracked follow-up).** Two groups of reads cannot be bounded by a
+wrapper at all, and need query-level work instead:
+
+- The streaming iterators listed above. Bounding them requires a SQL-level `LIMIT`
+  on the query (with a defined order and documented truncation) or adding paging to
+  their signatures, so the caller can ask for the next page rather than fail.
+- Reads that materialise a full slice or map before returning (e.g.
+  `ListUnspentTokens`, `QueryTokenDetails`, `ConfigurationsByID`, `GetWalletIDs`) —
+  the SQL has already loaded everything by the time the decorator sees the result.
+
+The opaque `Keystore.Put` value and input-size caps for variadic id lists
+(`DeleteTokens`, `GetTokens`) are in the same follow-up.
+
+## Ledger Drift Checks
+
+The Storage Service includes **Ledger Drift Checks**, a background sweep that compares what the node has stored against what the ledger says and reports every place the two disagree.
+
+For detailed documentation on the checks, their findings, configuration and metrics, see [**Ledger Drift Checks**](storage/checks.md).
+
+### Architecture
+
+The sweep is started by the check service provider, which the auditor and owner services already ask for a check service once per TMS. A node therefore runs one sweep per store it owns: `owner` over the `TTXDB` and `auditor` over the `AuditDB`. Like recovery and cleanup it elects a leader through a PostgreSQL advisory lock, on a lock id of its own so the sweeps do not wait on each other.
+
+### What It Checks
+
+- **Transaction Check**: the status of every locally stored transaction against the ledger's
+- **Unspent Tokens Check**: the content of every locally held unspent token against the ledger's copy
+- **Token Spendability Check**: whether every locally held unspent token can still be spent by the current TMS
+- **Local Completeness Check**: the outputs every confirmed transaction should have written locally against what is actually stored. This is the ledger-to-local direction the other checks cannot see, and the one that costs the owner money when it goes wrong
+
+The first three are also what the on-demand `Check` call on the auditor and owner services runs. The fourth rebuilds every confirmed transaction, so it runs in the background sweep only.
+
+### Findings
+
+Each divergence is recorded as a finding with a stable key, a code and a severity, in a findings table on the transaction store. A sweep ages a finding it sees again rather than storing it twice, and closes one it stops seeing, so the open findings are always the current state rather than a growing log. A check that could not complete never closes its own findings, so an unreachable ledger cannot be mistaken for a clean bill of health.
+
+### Configuration
+
+Drift check behavior is controlled by the `token.tms.<name>.services.storage.checks` configuration section. See [**Ledger Drift Checks**](storage/checks.md) for the parameters.

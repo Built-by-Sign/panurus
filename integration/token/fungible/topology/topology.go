@@ -9,6 +9,8 @@ package topology
 import (
 	"fmt"
 
+	tevm "github.com/LFDT-Panurus/panurus/integration/nwo/token/evm"
+
 	"github.com/LFDT-Panurus/panurus/integration/nwo/token"
 	fabric2 "github.com/LFDT-Panurus/panurus/integration/nwo/token/fabric"
 	"github.com/LFDT-Panurus/panurus/integration/nwo/token/generators/crypto/zkatdlognoghv1"
@@ -52,6 +54,17 @@ func Topology(opts common.Opts) []api.Topology {
 		fabricTopology.SetNamespaceApproverOrgs(orgs[0])
 		backendTopology = fabricTopology
 		backendChannel = fabricTopology.Channels[0].Name
+	case tevm.TopologyName:
+		// An EVM network has no organizations or channels to describe: what a node needs to reach the
+		// chain is generated with the network and handed to it in its token configuration.
+		evmTopology := tevm.NewTopology()
+		backendTopology = evmTopology
+		backendChannel = ""
+	case tevm.GatewayTopologyName:
+		// Same shape as the EVM backend; the topology type routes to the gateway handler, not Besu.
+		evmTopology := tevm.NewGatewayTopology()
+		backendTopology = evmTopology
+		backendChannel = ""
 	default:
 		panic("unknown backend: " + opts.Backend)
 	}
@@ -195,11 +208,17 @@ func Topology(opts common.Opts) []api.Topology {
 		if len(opts.FSCEndorsementPolicyType) > 0 {
 			fabric2.WithFSCEndorsementPolicyType(tms, opts.FSCEndorsementPolicyType)
 		}
-		if len(opts.NamespacePolicy) > 0 {
-			fabric2.WithNamespacePolicy(tms, opts.NamespacePolicy)
-		}
 	}
-	if opts.FSCEndorsementPolicyType == endorsementfsc.NamespacePolicy {
+	if len(opts.NamespacePolicy) > 0 {
+		fabric2.WithNamespacePolicy(tms, opts.NamespacePolicy)
+	}
+	if opts.EndorsersFromOwnOrg {
+		fabric2.WithEndorsersFromOwnOrg(tms)
+	}
+	// The token chaincode is hosted by Org1 alone unless the namespace endorsement policy
+	// spans more organizations: a policy naming an org whose peers do not host the
+	// chaincode can never be satisfied.
+	if opts.FSCEndorsementPolicyType == endorsementfsc.NamespacePolicy || len(opts.NamespacePolicy) > 0 {
 		fabric2.SetOrgs(tms, orgs...)
 	} else {
 		fabric2.SetOrgs(tms, "Org1")

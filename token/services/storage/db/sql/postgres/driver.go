@@ -10,11 +10,12 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
+	"slices"
 	"strings"
 
 	driver3 "github.com/LFDT-Panurus/panurus/token/services/storage/db/driver"
 	common3 "github.com/LFDT-Panurus/panurus/token/services/storage/db/sql/common"
-	"github.com/hyperledger-labs/fabric-smart-client/platform/common/utils"
+	"github.com/LFDT-Panurus/panurus/token/services/utils"
 	"github.com/hyperledger-labs/fabric-smart-client/platform/common/utils/lazy"
 	driver2 "github.com/hyperledger-labs/fabric-smart-client/platform/view/services/storage/driver"
 	"github.com/hyperledger-labs/fabric-smart-client/platform/view/services/storage/driver/common"
@@ -58,17 +59,20 @@ func NewDriver(config driver3.Config) *Driver {
 
 // NewDriverWithDbProvider returns a new Driver for Postgres using the given database provider.
 func NewDriverWithDbProvider(config driver3.Config, dbProvider fscPostgres.DbProvider) *Driver {
-	tableNamesConfig, err := common3.LoadTableNamesConfig(config)
+	storageConfig, err := common3.LoadStorageConfig(config)
 	if err != nil {
-		logger.Warnf("failed to load table name overrides: %v — using defaults", err)
+		logger.Warnf("failed to load storage config: %v — using defaults", err)
 	}
+	tableNamesConfig := storageConfig.TableNames
 
 	d := &Driver{
 		cp:               fscPostgres.NewConfigProvider(common.NewConfig(config)),
 		tableNamesConfig: tableNamesConfig,
 	}
 
-	d.TokenLock = newProviderWithKeyMapper(dbProvider, NewTokenLockStore, "tokenlock", tableNamesConfig)
+	d.TokenLock = newProviderWithKeyMapper(dbProvider, func(dbs *common.RWDB, tableNames common3.TableNames) (*TokenLockStore, error) {
+		return newTokenLockStoreWithStrategy(dbs, tableNames, storageConfig.LockStrategy)
+	}, "tokenlock", tableNamesConfig)
 	d.Identity = newIdentityStoreProvider(dbProvider, tableNamesConfig)
 	d.Wallet = newWalletStoreProvider(d, dbProvider, tableNamesConfig)
 	d.Token = newTokenStoreProvider(dbProvider, tableNamesConfig)
@@ -421,5 +425,30 @@ func createTableLockID(storeType string) int64 {
 // The lock is transaction-scoped (pg_advisory_xact_lock) and automatically released on commit/rollback.
 // This prevents conflicts when multiple replicas attempt to create the same tables simultaneously.
 func prefixSchemaWithLock(schema string, lockID int64) string {
-	return fmt.Sprintf("SELECT pg_advisory_xact_lock(%d);\n%s", lockID, schema)
+	return prefixSchemaWithLocks(schema, lockID)
+}
+
+// prefixSchemaWithLocks prefixes schema with one transaction-scoped advisory lock per id.
+//
+// A store whose schema emits DDL for a table another store also creates must hold that table's
+// lock as well, not just its own: CREATE TABLE/INDEX IF NOT EXISTS is not race-safe in
+// PostgreSQL, so two stores creating the same table under non-overlapping locks still collide
+// (a duplicate pg_type or relation error) and fail schema initialization at startup. Taking
+// both locks is what actually makes "whichever store runs first wins and the other is a no-op"
+// true. See the token store, which emits the TokenLocks DDL its anti-join depends on.
+//
+// The ids are acquired in ascending order, and duplicates collapse, so two stores that share a
+// subset of locks always acquire the shared ones in the same sequence and cannot deadlock.
+func prefixSchemaWithLocks(schema string, lockIDs ...int64) string {
+	ids := slices.Clone(lockIDs)
+	slices.Sort(ids)
+	ids = slices.Compact(ids)
+
+	var sb strings.Builder
+	for _, id := range ids {
+		fmt.Fprintf(&sb, "SELECT pg_advisory_xact_lock(%d);\n", id)
+	}
+	sb.WriteString(schema)
+
+	return sb.String()
 }

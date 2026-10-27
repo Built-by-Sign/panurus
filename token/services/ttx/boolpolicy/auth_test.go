@@ -11,7 +11,6 @@ package boolpolicy_test
 import (
 	"bytes"
 	"context"
-	"errors"
 	"testing"
 
 	"github.com/LFDT-Panurus/panurus/token"
@@ -20,11 +19,10 @@ import (
 	drivermock "github.com/LFDT-Panurus/panurus/token/driver/mock"
 	"github.com/LFDT-Panurus/panurus/token/services/identity"
 	identityboolpolicy "github.com/LFDT-Panurus/panurus/token/services/identity/boolpolicy"
-	"github.com/LFDT-Panurus/panurus/token/services/interop/htlc"
 	"github.com/LFDT-Panurus/panurus/token/services/logging"
 	"github.com/LFDT-Panurus/panurus/token/services/ttx/boolpolicy"
-	"github.com/LFDT-Panurus/panurus/token/services/ttx/multisig"
 	token2 "github.com/LFDT-Panurus/panurus/token/token"
+	"github.com/hyperledger-labs/fabric-smart-client/pkg/utils/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -180,13 +178,9 @@ func TestEscrowAuth_IsMine_AllComponentsMine(t *testing.T) {
 // Authorization order — regression for bound policy identities
 // ---------------------------------------------------------------------------
 
-// TestAuthorizationOrder_BoundPolicyIdentity wires the same authorization
-// chain as the fabtoken and zkatdlog drivers and replays the failure mode the
-// order guards against: once a policy composite identity is bound to a wallet
-// (AnonymousOwnerWallet.RegisterRecipient does this for the transfer rest),
-// a wallet-based authorization running first claims the token with no
-// ownership ids, so the token is stored without an ownership row and the
-// policy wallet's selector can no longer spend it.
+// TestAuthorizationOrder_BoundPolicyIdentity checks that the drivers' chain
+// (common.NewStandardAuthorization) still attributes a policy token to the
+// member's policy wallet once its composite identity is bound to a wallet.
 func TestAuthorizationOrder_BoundPolicyIdentity(t *testing.T) {
 	tok := makePolicyToken(t, "$0", []byte("alice"))
 
@@ -215,12 +209,7 @@ func TestAuthorizationOrder_BoundPolicyIdentity(t *testing.T) {
 	pp := &drivermock.PublicParameters{}
 	pp.AuditorsReturns(nil)
 
-	auth := common.NewAuthorizationMultiplexer(
-		htlc.NewScriptAuth(mockWS),
-		multisig.NewEscrowAuth(mockWS),
-		boolpolicy.NewEscrowAuth(mockWS),
-		common.NewTMSAuthorization(logging.MustGetLogger(), pp, mockWS),
-	)
+	auth := common.NewStandardAuthorization(logging.MustGetLogger(), pp, mockWS)
 
 	walletID, ids, isMine := auth.IsMine(t.Context(), tok)
 	assert.True(t, isMine)
@@ -228,9 +217,8 @@ func TestAuthorizationOrder_BoundPolicyIdentity(t *testing.T) {
 	require.Len(t, ids, 1)
 	assert.Equal(t, "policyw1", ids[0])
 
-	// The generic wallet-based authorization alone would claim the token
-	// under the base wallet id with no ownership ids — the exact answer the
-	// specific-first order exists to preempt.
+	// The wallet-based authorization alone would claim the token under the
+	// base wallet id with no ownership ids.
 	walletID, ids, isMine = common.NewTMSAuthorization(logging.MustGetLogger(), pp, mockWS).IsMine(t.Context(), tok)
 	assert.True(t, isMine)
 	assert.Equal(t, "baseWallet", walletID)

@@ -17,10 +17,8 @@ import (
 	v1token "github.com/LFDT-Panurus/panurus/token/core/zkatdlog/nogh/v1/token"
 	"github.com/LFDT-Panurus/panurus/token/core/zkatdlog/nogh/v1/validator"
 	"github.com/LFDT-Panurus/panurus/token/driver"
-	"github.com/LFDT-Panurus/panurus/token/services/interop/htlc"
 	"github.com/LFDT-Panurus/panurus/token/services/logging"
-	"github.com/LFDT-Panurus/panurus/token/services/ttx/boolpolicy"
-	"github.com/LFDT-Panurus/panurus/token/services/ttx/multisig"
+	"github.com/LFDT-Panurus/panurus/token/services/observability"
 	"github.com/LFDT-Panurus/panurus/token/services/utils"
 	"github.com/hyperledger-labs/fabric-smart-client/pkg/utils/errors"
 )
@@ -151,22 +149,29 @@ func (d *Driver) NewTokenService(tmsID driver.TMSID, publicParams []byte) (drive
 	}
 	deserializer := ws.Deserializer
 	ip := ws.IdentityProvider
+	// Decorate WalletService with circuit breaker protection loaded from TMS configuration and TMS-scoped Prometheus metrics.
+	// Note: metricsProvider is scoped via metrics.NewTMSProvider with the TMS ID, which injects
+	// the required network, channel, and namespace labels.
+	cbConfig := observability.LoadCircuitBreakerConfig(tmsConfig)
+	decoratedWS := observability.NewWalletServiceDecoratorWithConfig(ws, metricsProvider, cbConfig)
 
-	// Type-gated authorizations go first: the wallet-based one resolves any
-	// identity bound to a wallet, so it would claim escrow-typed tokens under
-	// the wrong wallet id and drop their ownership entries.
-	authorization := common.NewAuthorizationMultiplexer(
-		htlc.NewScriptAuth(ws),
-		multisig.NewEscrowAuth(ws),
-		boolpolicy.NewEscrowAuth(ws),
-		common.NewTMSAuthorization(logger, ppm.PublicParams(), ws),
-	)
+	authorization := common.NewStandardAuthorization(logger, ppm.PublicParams(), decoratedWS)
 
 	tokensService, err := v1token.NewTokensService(logger, ppm, deserializer)
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to initiliaze token service for [%s:%s]", tmsID.Network, tmsID.Namespace)
 	}
-	tokensUpgradeService, err := upgrade.NewService(logger, ppm.PublicParams().QuantityPrecision, deserializer, ip)
+	// the query engine gives access to every generation of public parameters this node has
+	// stored, which is what lets the upgrade service open commitments created before the
+	// public parameters were regenerated
+	tokensUpgradeService, err := upgrade.NewService(
+		logger,
+		ppm.PublicParams().QuantityPrecision,
+		deserializer,
+		ip,
+		tokensService.SupportedTokenFormats(),
+		upgrade.NewPublicParamsHistory(logger, qe),
+	)
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to initiliaze token upgrade service for [%s:%s]", tmsID.Network, tmsID.Namespace)
 	}
@@ -185,16 +190,16 @@ func (d *Driver) NewTokenService(tmsID driver.TMSID, publicParams []byte) (drive
 	)
 	service, err := v1.NewTokenService(
 		logger,
-		ws,
+		decoratedWS,
 		ppm,
 		ip,
 		deserializer,
 		tmsConfig,
-		metrics.NewIssueService(v1.NewIssueService(logger, ppm, ws, deserializer, tokensService, tokensUpgradeService), metricsProvider),
+		metrics.NewIssueService(v1.NewIssueService(logger, ppm, decoratedWS, deserializer, tokensService, tokensUpgradeService), metricsProvider),
 		metrics.NewTransferService(v1.NewTransferService(
 			logger,
 			ppm,
-			ws,
+			decoratedWS,
 			common.NewVaultLedgerTokenAndMetadataLoader[[]byte, []byte](qe, &common.IdentityTokenAndMetadataDeserializer{}),
 			deserializer,
 			d.tracerProvider,

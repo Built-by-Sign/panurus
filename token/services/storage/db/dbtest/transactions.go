@@ -17,6 +17,7 @@ import (
 	"github.com/LFDT-Panurus/panurus/token"
 	driver2 "github.com/LFDT-Panurus/panurus/token/driver"
 	driver3 "github.com/LFDT-Panurus/panurus/token/services/storage/db/driver"
+	"github.com/LFDT-Panurus/panurus/token/services/storage/db/sql/query/pagination"
 	"github.com/LFDT-Panurus/panurus/token/services/utils"
 	"github.com/hyperledger-labs/fabric-smart-client/platform/common/utils/collections/iterators"
 	"github.com/stretchr/testify/assert"
@@ -52,6 +53,7 @@ var tokenTransactionDBCases = []struct {
 	{"Rollback", TRollback},
 	{"TransactionQueries", TTransactionQueries},
 	{"TEndorserAcks", TEndorserAcks},
+	{"Findings", TFindings},
 }
 
 func TFailsIfRequestDoesNotExist(t *testing.T, db driver3.TokenTransactionStore) {
@@ -192,9 +194,9 @@ func TMovements(t *testing.T, db driver3.TokenTransactionStore) {
 	ctx := t.Context()
 	w, err := db.NewTransactionStoreTransaction()
 	require.NoError(t, err)
-	require.NoError(t, w.AddTokenRequest(ctx, "0", []byte{}, map[string][]byte{}, nil, driver2.PPHash("tr")))
-	require.NoError(t, w.AddTokenRequest(ctx, "1", []byte{}, map[string][]byte{}, nil, driver2.PPHash("tr")))
-	require.NoError(t, w.AddTokenRequest(ctx, "2", []byte{}, map[string][]byte{}, nil, driver2.PPHash("tr")))
+	require.NoError(t, w.AddTokenRequest(ctx, "0", []byte("token request for 0"), map[string][]byte{}, nil, driver2.PPHash("tr")))
+	require.NoError(t, w.AddTokenRequest(ctx, "1", []byte("token request for 1"), map[string][]byte{}, nil, driver2.PPHash("tr")))
+	require.NoError(t, w.AddTokenRequest(ctx, "2", []byte("token request for 2"), map[string][]byte{}, nil, driver2.PPHash("tr")))
 	require.NoError(t, w.AddMovement(ctx, driver3.MovementRecord{
 		TxID:         "0",
 		EnrollmentID: "alice",
@@ -309,7 +311,9 @@ func TTransaction(t *testing.T, db driver3.TokenTransactionStore) {
 
 	// get all except last year's
 	t1 := time.Now().Add(time.Second * 3)
-	it, err := db.QueryTransactions(ctx, driver3.QueryTransactionsParams{From: &t0, To: &t1, SearchDirection: driver3.FromBeginning}, nil)
+	page, err := pagination.Offset(0, 100)
+	require.NoError(t, err)
+	it, err := db.QueryTransactions(ctx, driver3.QueryTransactionsParams{From: &t0, To: &t1, SearchDirection: driver3.FromBeginning}, page)
 	require.NoError(t, err)
 	for _, exp := range txs {
 		act, err := it.Items.Next()
@@ -320,7 +324,9 @@ func TTransaction(t *testing.T, db driver3.TokenTransactionStore) {
 
 	// get all tx from before the first
 	yesterday := t0.AddDate(0, 0, -1).Local().UTC().Truncate(time.Second)
-	it, err = db.QueryTransactions(ctx, driver3.QueryTransactionsParams{To: &yesterday}, nil)
+	page, err = pagination.Offset(0, 100)
+	require.NoError(t, err)
+	it, err = db.QueryTransactions(ctx, driver3.QueryTransactionsParams{To: &yesterday}, page)
 	require.NoError(t, err)
 	defer it.Items.Close()
 
@@ -560,7 +566,7 @@ func TAllowsSameTxID(t *testing.T, db driver3.TokenTransactionStore) {
 	}
 	w, err := db.NewTransactionStoreTransaction()
 	require.NoError(t, err)
-	require.NoError(t, w.AddTokenRequest(ctx, tr1.TxID, []byte{}, map[string][]byte{}, nil, driver2.PPHash("tr")))
+	require.NoError(t, w.AddTokenRequest(ctx, tr1.TxID, []byte("token request for "+tr1.TxID), map[string][]byte{}, nil, driver2.PPHash("tr")))
 	require.NoError(t, w.AddTransaction(ctx, tr1))
 	require.NoError(t, w.AddTransaction(ctx, tr2))
 	require.NoError(t, w.Commit())
@@ -823,7 +829,7 @@ func TTransactionQueries(t *testing.T, db driver3.TokenTransactionStore) {
 	var previous string
 	for _, r := range tr {
 		if r.TxID != previous {
-			require.NoError(t, w.AddTokenRequest(ctx, r.TxID, []byte{}, map[string][]byte{}, nil, driver2.PPHash("tr")))
+			require.NoError(t, w.AddTokenRequest(ctx, r.TxID, []byte("token request for "+r.TxID), map[string][]byte{}, nil, driver2.PPHash("tr")))
 		}
 		require.NoError(t, w.AddTransaction(ctx, r))
 		previous = r.TxID
@@ -867,7 +873,9 @@ func TTransactionQueries(t *testing.T, db driver3.TokenTransactionStore) {
 
 func getTransactions(t *testing.T, db driver3.TokenTransactionStore, params driver3.QueryTransactionsParams) []*driver3.TransactionRecord {
 	t.Helper()
-	records, err := db.QueryTransactions(t.Context(), params, nil)
+	page, err := pagination.Offset(0, 100)
+	require.NoError(t, err)
+	records, err := db.QueryTransactions(t.Context(), params, page)
 	require.NoError(t, err)
 	txs, err := iterators.ReadAllPointers(records.Items)
 	require.NoError(t, err)
@@ -907,7 +915,7 @@ func createTestTransaction(t *testing.T, db driver3.TokenTransactionStore, txID 
 	if err != nil {
 		t.Fatalf("error creating transaction while trying to test something else: %s", err)
 	}
-	if err := w.AddTokenRequest(t.Context(), txID, []byte{}, map[string][]byte{}, nil, driver2.PPHash("tr")); err != nil {
+	if err := w.AddTokenRequest(t.Context(), txID, []byte("token request for "+txID), map[string][]byte{}, nil, driver2.PPHash("tr")); err != nil {
 		t.Fatalf("error creating token request while trying to test something else: %s", err)
 	}
 	tr1 := driver3.TransactionRecord{
@@ -926,4 +934,100 @@ func createTestTransaction(t *testing.T, db driver3.TokenTransactionStore, txID 
 	if err := w.Commit(); err != nil {
 		t.Fatalf("error committing transaction while trying to test something else: %s", err)
 	}
+}
+
+// TFindings exercises the drift findings table: a repeated finding is aged rather
+// than stored twice, a finding a sweep stops reporting is closed, and one that
+// comes back is reopened.
+func TFindings(t *testing.T, db driver3.TokenTransactionStore) {
+	t.Helper()
+	ctx := t.Context()
+
+	first := time.Now().UTC()
+	findings := []driver3.FindingRecord{
+		{Key: "critical-one", Checker: "Check A", Code: "code_a", Severity: 2, TxID: "tx1", TokenID: "tx1:0", Message: "bad"},
+		{Key: "warning-one", Checker: "Check B", Code: "code_b", Severity: 1, TxID: "tx2", Message: "meh"},
+	}
+	require.NoError(t, db.UpsertFindings(ctx, findings, first))
+
+	stored, err := db.QueryFindings(ctx, driver3.QueryFindingsParams{})
+	require.NoError(t, err)
+	require.Len(t, stored, 2)
+	// worst first
+	assert.Equal(t, "critical-one", stored[0].Key)
+	assert.Equal(t, "Check A", stored[0].Checker)
+	assert.Equal(t, "tx1:0", stored[0].TokenID)
+	assert.Equal(t, int64(1), stored[0].Occurrences)
+	assert.Nil(t, stored[0].ResolvedAt)
+	assert.Equal(t, "warning-one", stored[1].Key)
+
+	// the same problem seen again ages the row instead of adding one
+	second := first.Add(time.Minute)
+	aged := []driver3.FindingRecord{findings[0]}
+	aged[0].Message = "still bad"
+	require.NoError(t, db.UpsertFindings(ctx, aged, second))
+
+	stored, err = db.QueryFindings(ctx, driver3.QueryFindingsParams{Checkers: []string{"Check A"}})
+	require.NoError(t, err)
+	require.Len(t, stored, 1)
+	assert.Equal(t, int64(2), stored[0].Occurrences)
+	assert.Equal(t, "still bad", stored[0].Message)
+	assert.WithinDuration(t, first, stored[0].FirstSeen, time.Second)
+	assert.WithinDuration(t, second, stored[0].LastSeen, time.Second)
+
+	// the second sweep did not report Check B's finding, so it is closed
+	resolved, err := db.ResolveFindingsNotSeenSince(ctx, []string{"Check A", "Check B"}, second)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), resolved)
+
+	stored, err = db.QueryFindings(ctx, driver3.QueryFindingsParams{})
+	require.NoError(t, err)
+	require.Len(t, stored, 1)
+	assert.Equal(t, "critical-one", stored[0].Key)
+
+	stored, err = db.QueryFindings(ctx, driver3.QueryFindingsParams{IncludeResolved: true})
+	require.NoError(t, err)
+	require.Len(t, stored, 2)
+
+	// a checker that did not run may not close anything
+	resolved, err = db.ResolveFindingsNotSeenSince(ctx, nil, second.Add(time.Minute))
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), resolved)
+
+	// a closed finding that comes back is reopened, not duplicated
+	third := second.Add(2 * time.Minute)
+	require.NoError(t, db.UpsertFindings(ctx, []driver3.FindingRecord{findings[1]}, third))
+	stored, err = db.QueryFindings(ctx, driver3.QueryFindingsParams{Checkers: []string{"Check B"}})
+	require.NoError(t, err)
+	require.Len(t, stored, 1)
+	assert.Nil(t, stored[0].ResolvedAt)
+	assert.Equal(t, int64(2), stored[0].Occurrences)
+
+	// filters
+	stored, err = db.QueryFindings(ctx, driver3.QueryFindingsParams{MinSeverity: 2})
+	require.NoError(t, err)
+	require.Len(t, stored, 1)
+	assert.Equal(t, "critical-one", stored[0].Key)
+
+	stored, err = db.QueryFindings(ctx, driver3.QueryFindingsParams{Codes: []string{"code_b"}})
+	require.NoError(t, err)
+	require.Len(t, stored, 1)
+	assert.Equal(t, "warning-one", stored[0].Key)
+
+	stored, err = db.QueryFindings(ctx, driver3.QueryFindingsParams{Limit: 1})
+	require.NoError(t, err)
+	require.Len(t, stored, 1)
+
+	// an empty sweep is a no-op rather than an error
+	require.NoError(t, db.UpsertFindings(ctx, nil, third))
+
+	// the same key twice in one sweep must not make the insert conflict with itself
+	duplicate := driver3.FindingRecord{Key: "dup", Checker: "Check C", Code: "code_c", Severity: 1, Message: "one"}
+	other := duplicate
+	other.Message = "two"
+	require.NoError(t, db.UpsertFindings(ctx, []driver3.FindingRecord{duplicate, other}, third))
+	stored, err = db.QueryFindings(ctx, driver3.QueryFindingsParams{Checkers: []string{"Check C"}})
+	require.NoError(t, err)
+	require.Len(t, stored, 1)
+	assert.Equal(t, "two", stored[0].Message)
 }

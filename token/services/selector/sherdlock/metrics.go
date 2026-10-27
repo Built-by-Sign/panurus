@@ -28,6 +28,56 @@ type Metrics struct {
 	SelectionOutcome metrics.Counter
 	// ImmediateRetries tracks the distribution of immediate retry counts per Select() call.
 	ImmediateRetries metrics.Histogram
+	// LockConflicts counts every lost lock race (TryLock finding a token already
+	// locked by another process). Deliberately unlabeled by token id or wallet id:
+	// either would be unbounded cardinality. Per-token attribution belongs in the
+	// debug-level log line in selector.go and in the `tokendiag locks` command.
+	LockConflicts metrics.Counter
+	// DistinctTokensAttempted tracks, per Select() call, how many distinct tokens
+	// were tried: the lock was won, lost to another process, or denied by the rate
+	// limiter. This is what distinguishes "one hot token retried many times" from
+	// "many tokens each contended once".
+	DistinctTokensAttempted metrics.Histogram
+	// LockStoreErrors counts every TryLock/TryLockBatch failure that is not a lock
+	// conflict (i.e. does not wrap driver.ErrTokenAlreadyLocked): a genuine store
+	// error - connection failure, timeout, etc. Unlike LockConflicts, this signals a
+	// problem with the store itself rather than ordinary contention: to the caller
+	// both currently surface identically (as locked funds, see selector.go), so this
+	// is what distinguishes "the DB is unhealthy" from "tokens are just contended" in
+	// dashboards and alerts. See #2395.
+	LockStoreErrors metrics.Counter
+	// StaleCandidates counts candidates dropped because the token was no longer
+	// spendable by the time the lock was attempted (driver.ErrTokenNotSpendable) - a
+	// candidate served from a snapshot the store had already moved past. It measures
+	// how far behind the eager fetcher's cache runs under load: unlike LockConflicts
+	// it is not contention, and unlike LockStoreErrors it is not ill health.
+	//
+	// Both lock paths increment it. A batch-capable backend reports the candidates it
+	// refused as no longer spendable alongside the ones it won
+	// (dbdriver.BatchLockOutcome, implemented by postgres.TokenLockStore.LockBatch),
+	// which is what keeps this counter meaningful on a batch-capable deployment rather
+	// than pinned at zero with the drops folded into LockConflicts. A backend that
+	// wins or does not win a candidate without saying why is still permitted, and on
+	// one of those this counter does read zero, with a rising LockConflicts and no
+	// actual contention the symptom to read instead. See the batch loser branch of
+	// Selector.selectInternal (selector.go) and #2395.
+	StaleCandidates metrics.Counter
+	// CacheInvalidations counts every time the selector told its candidate source that
+	// the source's snapshot is behind the token store (CacheInvalidator.InvalidateCache),
+	// which makes the next read of it re-query the store. It is raised on two occasions:
+	// a candidate the lock refused as no longer spendable (see StaleCandidates), and a
+	// scan that ran out of candidates and is about to refetch, since the candidate query
+	// hides tokens locked by others and so cannot show a lock released since the snapshot
+	// was taken.
+	//
+	// It is the cost side of those recoveries: an invalidation does not itself query the
+	// store, but it turns the next read into a full refresh for the eager and mixed
+	// strategies, and several invalidations before that read collapse into one. Per
+	// Select() call the count is bounded by one per refetch, so by selection_immediate_retries
+	// plus one, plus one per stale candidate. A rate approaching that bound on every call
+	// means the freshness interval is long relative to how fast the wallet turns over, and
+	// the eager strategy is paying for a snapshot it cannot keep.
+	CacheInvalidations metrics.Counter
 }
 
 func NewMetrics(p metrics.Provider) *Metrics {
@@ -53,6 +103,27 @@ func NewMetrics(p metrics.Provider) *Metrics {
 			Name:    "selection_immediate_retries",
 			Help:    "Distribution of immediate retry counts per token selection call",
 			Buckets: []float64{0, 1, 2, 3, 4, 5},
+		}),
+		LockConflicts: p.NewCounter(metrics.CounterOpts{
+			Name: "lock_conflicts_total",
+			Help: "Total number of lost lock races (a token was already locked by another process)",
+		}),
+		DistinctTokensAttempted: p.NewHistogram(metrics.HistogramOpts{
+			Name:    "distinct_tokens_attempted",
+			Help:    "Distribution of the number of distinct tokens a lock was attempted on (won, lost, or rate-limited) per token selection call",
+			Buckets: []float64{1, 2, 5, 10, 25, 50, 100},
+		}),
+		LockStoreErrors: p.NewCounter(metrics.CounterOpts{
+			Name: "lock_store_errors_total",
+			Help: "Total number of TryLock/TryLockBatch failures that are not lock conflicts (a genuine store error)",
+		}),
+		StaleCandidates: p.NewCounter(metrics.CounterOpts{
+			Name: "stale_candidates_total",
+			Help: "Total number of candidate tokens dropped because they were no longer spendable when the lock was attempted",
+		}),
+		CacheInvalidations: p.NewCounter(metrics.CounterOpts{
+			Name: "cache_invalidations_total",
+			Help: "Total number of times the candidate source was told its snapshot is behind the token store, forcing the next read to refresh it",
 		}),
 	}
 }

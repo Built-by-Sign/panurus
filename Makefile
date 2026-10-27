@@ -3,10 +3,10 @@ FABRIC_VERSION ?= 3.1.4
 FABRIC_CA_VERSION ?= 1.5.7
 FABRIC_TWO_DIGIT_VERSION = $(shell echo $(FABRIC_VERSION) | cut -d '.' -f 1,2)
 
-FABRIC_X_TOOLS_VERSION ?= v1.0.1
-FABRIC_X_COMMITTER_VERSION ?= 1.0.4
+FABRIC_X_TOOLS_VERSION ?= v1.0.3
+FABRIC_X_COMMITTER_VERSION ?= 1.0.7
 
-# need to install fabric binaries outside of panuru's  tree for now (due to chaincode packaging issues)
+# need to install fabric binaries outside of panurus' tree for now (due to chaincode packaging issues)
 FABRIC_BINARY_BASE=$(PWD)/../fabric
 FAB_BINS ?= $(FABRIC_BINARY_BASE)/bin
 
@@ -22,9 +22,18 @@ GINKGO_TEST_OPTS += --keep-going -cover
 # -coverpkg the main-module (`token/...`) packages are NOT instrumented and their
 # end-to-end coverage is lost from the report. FSC's builder forwards the environment
 # to `go build`, so exporting GOFLAGS with a targeted -coverpkg restores it.
+#
+# -covermode=atomic is pinned for the same reason: some suites call
+# EnableRaceDetector() (see integration/token/test_utils.go), which makes FSC's
+# node builder (gexec.Build with -race) require -covermode=atomic for those
+# binaries specifically. `go tool covdata` refuses to merge meta-data files that
+# don't all share the same counter mode, so every cover-instrumented binary in a
+# run -- FSC nodes, the ginkgo suite itself, and the chaincode built by
+# ci/external-builders/golang/bin/build -- must agree on one mode; atomic is
+# valid with or without -race, so it's the one choice that works everywhere.
 COVERPKG ?= github.com/LFDT-Panurus/panurus/...
 ifdef GOCOVERDIR
-export GOFLAGS := -coverpkg=$(COVERPKG)
+export GOFLAGS := -coverpkg=$(COVERPKG) -covermode=atomic
 endif
 
 TOP = .
@@ -33,7 +42,7 @@ TOP = .
 include $(TOP)/checks.mk
 
 # Define all Go module directories
-GO_MODULES := . integration token/services/storage/db/kvs/hashicorp cmd/artifactgen cmd/tokengen cmd/token_validation_service cmd/profiler cmd/skicleanup cmd/node
+GO_MODULES := . integration token/services/storage/db/kvs/hashicorp cmd/artifactgen cmd/tokengen cmd/token_validation_service cmd/profiler cmd/skicleanup cmd/tokendiag cmd/node x/token/services/network/evm
 TIDY_GO_MODULES := $(GO_MODULES) tools
 
 # include fabricx target
@@ -42,6 +51,8 @@ include $(TOP)/fabricx.mk
 include $(TOP)/interop.mk
 # include the fungible target
 include $(TOP)/fungible.mk
+# include the evm targets
+include $(TOP)/evm.mk
 
 all: install-tools install-softhsm checks unit-tests #integration-tests
 
@@ -50,7 +61,7 @@ all: install-tools install-softhsm checks unit-tests #integration-tests
 install-tools:
 # Thanks for great inspiration https://marcofranssen.nl/manage-go-tools-via-go-modules
 	@echo Installing tools from tools/tools.go
-	@cd tools; cat tools.go | grep _ | awk -F'"' '{print $$2}' | xargs -tI % go install %
+	@cd tools; cat tools.go | grep _ | awk -F'"' '{print $$2}' | xargs -tI % bash -c 'go install % || (sleep 2 && go install %)'
 	@$(MAKE) install-linter-tool
 
 .PHONY: download-fabric
@@ -61,17 +72,33 @@ download-fabric:
 GO_TEST_PARAMS ?= -coverpkg=./... -coverprofile=profile.cov
 GO_PACKAGES = $(shell go list ./... | grep -v '/integration/' | grep -v 'regression' | grep -v 'mock' |  grep -v 'protos-go' |  grep -v 'testutils'; go list ./integration/nwo/...)
 
+.PHONY: benchmark-selector-postgres
+# benchmark the token selectors against a real Postgres (needs `make testing-docker-images`).
+# BENCH_FILTER narrows the run, e.g. BENCH_FILTER='hot-wallet/.*skipLocked'.
+# BENCH_COUNT repeats every case that many times (go test -count) in one go test invocation, so
+# the N repeats of every case land in a single output file benchstat can read with -col - see
+# "Statistics with benchstat" in token/services/selector/README.md.
+BENCH_FILTER ?= .
+BENCH_TIME ?= 100x
+BENCH_COUNT ?= 1
+benchmark-selector-postgres:
+	@go test ./token/services/selector/ -run '^$$' -bench 'BenchmarkSelectorPostgres/$(BENCH_FILTER)' -benchtime=$(BENCH_TIME) -count=$(BENCH_COUNT) -benchmem -timeout 90m
+
 .PHONY: unit-tests
 # run standard unit tests
 unit-tests:
 	@go test $(GO_TEST_PARAMS) $(GO_PACKAGES)
 	cd token/services/storage/db/kvs/hashicorp/; go test -cover ./...
+	cd x/token/services/network/evm; go test -coverpkg=./... -coverprofile=profile.cov ./...
+	@tail -n +2 x/token/services/network/evm/profile.cov >> profile.cov
+	@rm -f x/token/services/network/evm/profile.cov
 
 .PHONY: unit-tests-race
 # run unit tests with race detection
 unit-tests-race:
 	@export GORACE=history_size=7; go test -race -cover $(shell go list ./... | grep -v '/integration/'  | grep -v 'regression')
 	cd integration/nwo/; go test -cover ./...
+	@export GORACE=history_size=7; cd x/token/services/network/evm; go test -race -cover ./...
 
 .PHONY: unit-tests-regression
 # run regression unit tests
@@ -83,9 +110,15 @@ unit-tests-regression:
 install-softhsm:
 	./ci/scripts/install_softhsm.sh
 
+# The EVM integration suites run against this Besu image.
+BESU_IMAGE ?= hyperledger/besu:24.3.0
+
+# The EVM gateway integration suite runs against this fabric-x-evm image.
+FABRICX_EVM_IMAGE ?= ghcr.io/hyperledger/fabric-x-evm:0.1.3
+
 .PHONY: docker-images
 # build/pull docker images needed for testing
-docker-images: fabric-docker-images monitoring-docker-images testing-docker-images
+docker-images: fabric-docker-images monitoring-docker-images testing-docker-images besu-docker-images fabricx-evm-docker-images
 
 .PHONY: testing-docker-images
 # pull docker images for testing (postgres, vault)
@@ -150,6 +183,14 @@ clean:
 	rm -rf ./integration/token/fungible/dlog/out/
 	rm -rf ./integration/token/fungible/dlog/testdata/
 	rm -rf ./integration/token/fungible/dlogx/out/
+	rm -rf ./integration/token/fungible/evm/out/
+	rm -rf ./integration/token/fungible/evm/testdata/
+	rm -rf ./integration/token/fungible/evmfabtoken/out/
+	rm -rf ./integration/token/fungible/evmfabtoken/testdata/
+	rm -rf ./integration/token/fungible/evmgw/out/
+	rm -rf ./integration/token/fungible/evmgw/testdata/
+	rm -rf ./integration/token/fungible/evmgwfabtoken/out/
+	rm -rf ./integration/token/fungible/evmgwfabtoken/testdata/
 	rm -rf ./integration/token/fungible/dloghsm/out/
 	rm -rf ./integration/token/fungible/dloghsm/testdata/
 	rm -rf ./integration/token/fungible/dlogstress/out/
@@ -190,6 +231,11 @@ artifactgen:
 # install skicleanup tool (must build without cgo; see #1445)
 skicleanup:
 	@cd ./cmd/skicleanup/; CGO_ENABLED=0 go install github.com/LFDT-Panurus/panurus/cmd/skicleanup
+
+.PHONY: tokendiag
+# install tokendiag tool (must build without cgo; see #1445)
+tokendiag:
+	@cd ./cmd/tokendiag/; CGO_ENABLED=0 go install github.com/LFDT-Panurus/panurus/cmd/tokendiag
 
 .PHONY: traceinspector
 # install traceinspector tool
@@ -257,7 +303,7 @@ lint-auto-fix:
 # install golangci-lint
 install-linter-tool:
 	@echo "Installing golangci Linter"
-	@curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh | sh -s -- -b $(HOME)/go/bin v2.12.2
+	@curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh | sh -s -- -b $(HOME)/go/bin v2.14.0
 
 .PHONY: fmt
 fmt: ## Run gofmt on the entire project
