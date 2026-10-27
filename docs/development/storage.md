@@ -113,6 +113,7 @@ therefore shaped around the predicates those queries use.
 | `idx_owner_wallet_part_<t>` | `owner_wallet_id, token_type` | `is_deleted = false AND owner = true` | Unspent tokens of a wallet and type. |
 | `idx_issued_<t>` | `redeemed, token_type` | `issuer = true` | Issued/redeemed balances. |
 | `idx_spendable_amount_<t>` | `owner_wallet_id, token_type, amount` | `is_deleted = false AND owner = true AND spendable = true` | Spendable tokens of a wallet and type, by amount. |
+| `idx_wallet_id_<o>` (on the ownership table) | `wallet_id` | — | Branch 2 of `UnspentTokensIteratorBy`, which filters on `ownership.wallet_id`; the primary key `(tx_id, idx, wallet_id)` cannot serve that predicate. |
 
 `amount` is a `NUMERIC(78, 0)` mirror of the authoritative hex `quantity`, maintained on
 write by `StoreToken`. `idx_spendable_amount_<t>` makes it usable as a range: with equality on
