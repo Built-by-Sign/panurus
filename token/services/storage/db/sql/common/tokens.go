@@ -1705,6 +1705,7 @@ func (db *TokenStore) GetSchema() string {
 			PRIMARY KEY (tx_id, idx, wallet_id),
 			FOREIGN KEY (tx_id, idx) REFERENCES %s
 		);
+		CREATE INDEX IF NOT EXISTS idx_wallet_id_%s ON %s ( wallet_id );
 
 		-- Public Parameters
 		CREATE TABLE IF NOT EXISTS %s (
@@ -1743,7 +1744,7 @@ func (db *TokenStore) GetSchema() string {
 		db.table.Tokens, db.table.Tokens,
 		db.table.Tokens, db.table.Tokens,
 		db.table.Tokens, db.table.Tokens,
-		db.table.Ownership, db.table.Tokens,
+		db.table.Ownership, db.table.Tokens, db.table.Ownership, db.table.Ownership,
 		db.table.PublicParams, db.table.PublicParams, db.table.PublicParams,
 		db.table.Certifications, db.table.Tokens,
 		db.table.TokenSKICleanups, db.table.Tokens, db.table.TokenSKICleanups, db.table.TokenSKICleanups,
