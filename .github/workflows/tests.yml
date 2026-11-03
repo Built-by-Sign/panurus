@@ -121,8 +121,24 @@ jobs:
     needs: checks
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        tests: [unit-tests-race, unit-tests-regression]
+        # unit-tests-race is split into shards (see the unit-tests-race-* targets in the Makefile)
+        # that run as parallel jobs. Each race shard also writes the coverage profile, so the suite
+        # is no longer run a second time without -race just for coverage.
+        include:
+          - tests: unit-tests-race-db
+            coverage: true
+            # The selector and storage tests start Postgres and Vault containers.
+            docker: true
+          - tests: unit-tests-race-core
+            coverage: true
+          - tests: unit-tests-race-rest
+            coverage: true
+            # This shard runs the evm module's anvil e2e suite and the Solidity contract tests.
+            foundry: true
+          # The regression package reports no statements, so it uploads no coverage.
+          - tests: unit-tests-regression
 
     steps:
       - name: Checkout code
@@ -143,10 +159,10 @@ jobs:
         run: make install-tools
 
       - name: Set up foundry
-        # Only the race leg runs the evm module's anvil e2e suite and the Solidity tests. Without forge
-        # on the regression leg its unit run skips that suite instead of running it a third time.
-        if: matrix.tests == 'unit-tests-race'
-        uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
+        # Only the shard that runs the evm module needs forge and anvil. Without them its anvil e2e
+        # suite would be skipped instead of run.
+        if: matrix.foundry
+        uses: foundry-rs/foundry-toolchain@dba66c27052e63476d886f22216e119ba7e615bf # v1.9.2
         with:
           # Matches the pin used by the itest job's own "Set up foundry" step below; see its comment
           # for why 1.7.1 rather than latest. Nothing here talks to the fabric-x-evm gateway that pin
@@ -155,14 +171,18 @@ jobs:
           version: v1.7.1
 
       - name: Install Testing Docker Images
+        if: matrix.docker
         run: make testing-docker-images
 
-      - name: Unit Tests with Coverage
+      - name: Run ${{ matrix.tests }}
         run: |
-          make unit-tests
-          ./ci/scripts/filter-coverage.sh profile.cov profile.cov
+          make ${{ matrix.tests }} ${{ matrix.coverage && 'COVERAGE=1' || '' }}
+          if [ -n "${{ matrix.coverage }}" ]; then
+            ./ci/scripts/filter-coverage.sh profile.cov profile.cov
+          fi
 
       - name: Send coverage to Coveralls
+        if: matrix.coverage
         uses: coverallsapp/github-action@8d6379e14d29928660c4ba802d8e85393440b329 # v2.3.8
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -171,13 +191,10 @@ jobs:
           parallel: true
           fail-on-error: false
 
-      - name: Run ${{ matrix.tests }}
-        run: make ${{ matrix.tests }}
-
       # A separate step, after the Go tests and the coverage upload, so a contract or formatting
       # failure is reported on its own instead of hiding the Go results. Once per run is enough.
       - name: Solidity contract tests
-        if: matrix.tests == 'unit-tests-race'
+        if: matrix.foundry
         run: make test-evm-contracts EVM_CONTRACTS_REQUIRED=1
 
   itest:
@@ -234,6 +251,7 @@ jobs:
           dlog-fabric-t13,
 #          dlog-fabric-t14,
           dlog-fabric-t15,
+          dlog-fabric-t17,
           fabricx-dlog-t1-websocket,
           fabricx-dlog-t1-libp2p,
           fabricx-dlog-t1-replicas,
@@ -268,6 +286,7 @@ jobs:
           fabtoken-fabric-t3,
           fabtoken-fabric-t4,
           fabtoken-fabric-t5,
+          fabtoken-fabric-t17,
           update-t1,
           update-t2,
           update-t3,
@@ -336,7 +355,7 @@ jobs:
 
       - name: Set up foundry
         if: startsWith(matrix.tests, 'evm')
-        uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
+        uses: foundry-rs/foundry-toolchain@dba66c27052e63476d886f22216e119ba7e615bf # v1.9.2
         with:
           # Pinned rather than "stable": forge 1.8.1 fails to deploy the contracts against the
           # fabric-x-evm gateway backend (evm-gateway/evm-gateway-fabtoken suites) with "Failed to

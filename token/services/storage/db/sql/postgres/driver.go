@@ -15,6 +15,7 @@ import (
 
 	driver3 "github.com/LFDT-Panurus/panurus/token/services/storage/db/driver"
 	common3 "github.com/LFDT-Panurus/panurus/token/services/storage/db/sql/common"
+	"github.com/LFDT-Panurus/panurus/token/services/storage/db/sql/dbpool"
 	"github.com/LFDT-Panurus/panurus/token/services/utils"
 	"github.com/hyperledger-labs/fabric-smart-client/platform/common/utils/lazy"
 	driver2 "github.com/hyperledger-labs/fabric-smart-client/platform/view/services/storage/driver"
@@ -44,11 +45,14 @@ type Driver struct {
 	KeyStore  lazy.Provider[fscPostgres.Config, *KeystoreStore]
 }
 
-// NewNamedDriver returns a NamedDriver for Postgres.
-func NewNamedDriver(config driver3.Config, dbProvider fscPostgres.DbProvider) driver3.NamedDriver {
+// NewNamedDriver returns a NamedDriver for Postgres. sampler, when non-nil, is
+// registered with the *sql.DB behind every data source this driver's stores
+// open, so a connection pool shared by several stores is still reported as
+// one series - see dbpool.Sampler.Register and observedDbProvider below.
+func NewNamedDriver(config driver3.Config, dbProvider fscPostgres.DbProvider, sampler *dbpool.Sampler) driver3.NamedDriver {
 	return driver3.NamedDriver{
 		Name:   fscPostgres.Persistence,
-		Driver: NewDriverWithDbProvider(config, dbProvider),
+		Driver: newDriver(config, dbProvider, sampler),
 	}
 }
 
@@ -58,12 +62,23 @@ func NewDriver(config driver3.Config) *Driver {
 }
 
 // NewDriverWithDbProvider returns a new Driver for Postgres using the given database provider.
+// It never reports connection-pool metrics; use NewNamedDriver for that.
 func NewDriverWithDbProvider(config driver3.Config, dbProvider fscPostgres.DbProvider) *Driver {
+	return newDriver(config, dbProvider, nil)
+}
+
+// newDriver is the shared constructor behind NewDriverWithDbProvider (no pool
+// metrics) and NewNamedDriver (pool metrics via sampler, when non-nil).
+func newDriver(config driver3.Config, dbProvider fscPostgres.DbProvider, sampler *dbpool.Sampler) *Driver {
 	storageConfig, err := common3.LoadStorageConfig(config)
 	if err != nil {
 		logger.Warnf("failed to load storage config: %v — using defaults", err)
 	}
 	tableNamesConfig := storageConfig.TableNames
+
+	if sampler != nil {
+		dbProvider = &observedDbProvider{inner: dbProvider, sampler: sampler}
+	}
 
 	d := &Driver{
 		cp:               fscPostgres.NewConfigProvider(common.NewConfig(config)),
@@ -87,16 +102,7 @@ func NewDriverWithDbProvider(config driver3.Config, dbProvider fscPostgres.DbPro
 // newTokenStoreProvider returns a lazy provider for TokenStore.
 func newTokenStoreProvider(dbProvider fscPostgres.DbProvider, tableNamesConfig common3.TableNamesConfig) lazy.Provider[fscPostgres.Config, *TokenStore] {
 	return lazy.NewProviderWithKeyMapper(key, func(o fscPostgres.Config) (*TokenStore, error) {
-		opts := fscPostgres.Opts{
-			DataSource:      o.DataSource,
-			MaxOpenConns:    o.MaxOpenConns,
-			MaxIdleConns:    *o.MaxIdleConns,
-			MaxIdleTime:     *o.MaxIdleTime,
-			TablePrefix:     o.TablePrefix,
-			TableNameParams: o.TableNameParams,
-			Tracing:         o.Tracing,
-		}
-		dbs, err := dbProvider.Get(opts)
+		dbs, err := dbProvider.Get(o.Opts())
 		if err != nil {
 			return nil, err
 		}
@@ -132,16 +138,7 @@ func newTokenStoreProvider(dbProvider fscPostgres.DbProvider, tableNamesConfig c
 // newIdentityStoreProvider returns a lazy provider for IdentityStore.
 func newIdentityStoreProvider(dbProvider fscPostgres.DbProvider, tableNamesConfig common3.TableNamesConfig) lazy.Provider[fscPostgres.Config, *IdentityStore] {
 	return lazy.NewProviderWithKeyMapper(key, func(o fscPostgres.Config) (*IdentityStore, error) {
-		opts := fscPostgres.Opts{
-			DataSource:      o.DataSource,
-			MaxOpenConns:    o.MaxOpenConns,
-			MaxIdleConns:    *o.MaxIdleConns,
-			MaxIdleTime:     *o.MaxIdleTime,
-			TablePrefix:     o.TablePrefix,
-			TableNameParams: o.TableNameParams,
-			Tracing:         o.Tracing,
-		}
-		dbs, err := dbProvider.Get(opts)
+		dbs, err := dbProvider.Get(o.Opts())
 		if err != nil {
 			return nil, err
 		}
@@ -172,16 +169,7 @@ func newIdentityStoreProvider(dbProvider fscPostgres.DbProvider, tableNamesConfi
 // newTransactionStoreProvider returns a lazy provider for TransactionStore with notifier support.
 func newTransactionStoreProvider(dbProvider fscPostgres.DbProvider, tableNamesConfig common3.TableNamesConfig) lazy.Provider[fscPostgres.Config, *TransactionStore] {
 	return lazy.NewProviderWithKeyMapper(key, func(o fscPostgres.Config) (*TransactionStore, error) {
-		opts := fscPostgres.Opts{
-			DataSource:      o.DataSource,
-			MaxOpenConns:    o.MaxOpenConns,
-			MaxIdleConns:    *o.MaxIdleConns,
-			MaxIdleTime:     *o.MaxIdleTime,
-			TablePrefix:     o.TablePrefix,
-			TableNameParams: o.TableNameParams,
-			Tracing:         o.Tracing,
-		}
-		dbs, err := dbProvider.Get(opts)
+		dbs, err := dbProvider.Get(o.Opts())
 		if err != nil {
 			return nil, err
 		}
@@ -224,16 +212,7 @@ func newWalletStoreProvider(d *Driver, dbProvider fscPostgres.DbProvider, tableN
 			return nil, err
 		}
 
-		opts := fscPostgres.Opts{
-			DataSource:      o.DataSource,
-			MaxOpenConns:    o.MaxOpenConns,
-			MaxIdleConns:    *o.MaxIdleConns,
-			MaxIdleTime:     *o.MaxIdleTime,
-			TablePrefix:     o.TablePrefix,
-			TableNameParams: o.TableNameParams,
-			Tracing:         o.Tracing,
-		}
-		dbs, err := dbProvider.Get(opts)
+		dbs, err := dbProvider.Get(o.Opts())
 		if err != nil {
 			return nil, err
 		}
@@ -338,16 +317,7 @@ func (d *Driver) NewEndorser(name driver2.PersistenceName, params ...string) (dr
 // newEndorserStoreProvider returns a lazy provider for EndorserStore.
 func newEndorserStoreProvider(dbProvider fscPostgres.DbProvider, tableNamesConfig common3.TableNamesConfig) lazy.Provider[fscPostgres.Config, *EndorserStore] {
 	return lazy.NewProviderWithKeyMapper(key, func(o fscPostgres.Config) (*EndorserStore, error) {
-		opts := fscPostgres.Opts{
-			DataSource:      o.DataSource,
-			MaxOpenConns:    o.MaxOpenConns,
-			MaxIdleConns:    *o.MaxIdleConns,
-			MaxIdleTime:     *o.MaxIdleTime,
-			TablePrefix:     o.TablePrefix,
-			TableNameParams: o.TableNameParams,
-			Tracing:         o.Tracing,
-		}
-		dbs, err := dbProvider.Get(opts)
+		dbs, err := dbProvider.Get(o.Opts())
 		if err != nil {
 			return nil, err
 		}
@@ -373,19 +343,34 @@ func newEndorserStoreProvider(dbProvider fscPostgres.DbProvider, tableNamesConfi
 	})
 }
 
+// observedDbProvider decorates a fscPostgres.DbProvider so every pool it
+// hands out is registered with a dbpool.Sampler. It wraps the interface
+// rather than the lazy.Provider underneath fscPostgres.NewDbProvider(), so it
+// runs on every Get() call including a cache hit - Register itself dedupes on
+// the data source, so a repeat registration is free.
+//
+// Only ReadDB is registered: postgres.Open (fabric-smart-client) returns the
+// same *sql.DB for both ReadDB and WriteDB, so registering both would double
+// count one pool as two.
+type observedDbProvider struct {
+	inner   fscPostgres.DbProvider
+	sampler *dbpool.Sampler
+}
+
+func (p *observedDbProvider) Get(opts fscPostgres.Opts) (*common.RWDB, error) {
+	dbs, err := p.inner.Get(opts)
+	if err != nil {
+		return nil, err
+	}
+	p.sampler.Register(opts.DataSource, dbpool.PoolLabel(opts.DataSource), dbs.ReadDB)
+
+	return dbs, nil
+}
+
 // newProviderWithKeyMapper returns a lazy provider for a DB object using a common constructor.
 func newProviderWithKeyMapper[V common.DBObject](dbProvider fscPostgres.DbProvider, constructor common3.PersistenceConstructor[V], storeType string, tableNamesConfig common3.TableNamesConfig) lazy.Provider[fscPostgres.Config, V] {
 	return lazy.NewProviderWithKeyMapper(key, func(o fscPostgres.Config) (V, error) {
-		opts := fscPostgres.Opts{
-			DataSource:      o.DataSource,
-			MaxOpenConns:    o.MaxOpenConns,
-			MaxIdleConns:    *o.MaxIdleConns,
-			MaxIdleTime:     *o.MaxIdleTime,
-			TablePrefix:     o.TablePrefix,
-			TableNameParams: o.TableNameParams,
-			Tracing:         o.Tracing,
-		}
-		dbs, err := dbProvider.Get(opts)
+		dbs, err := dbProvider.Get(o.Opts())
 		if err != nil {
 			return utils.Zero[V](), err
 		}

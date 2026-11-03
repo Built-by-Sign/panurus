@@ -43,7 +43,7 @@ panurus_services_certifier_interactive_certification_pending_tokens | gauge | ch
 panurus_services_certifier_interactive_certification_request_duration_seconds | histogram | channel,namespace | token/services/certifier/interactive/metrics.go | Histogram of certification batch request durations in seconds.
 panurus_services_certifier_interactive_certified_tokens | counter | network,channel,namespace | token/services/certifier/interactive/metrics.go | The number of tokens certified.
 panurus_services_network_fabricx_finality_queue_finality_queue_enqueue_drops_total | counter | - | token/services/network/fabricx/finality/queue/metrics.go | Total number of finality events dropped because the queue was full
-panurus_services_network_fabricx_finality_queue_finality_queue_pending_events | gauge | - | token/services/network/fabricx/finality/queue/metrics.go | Current number of finality events waiting in the queue buffer
+panurus_services_network_fabricx_finality_queue_finality_queue_pending_events | gauge | - | token/services/network/fabricx/finality/queue/metrics.go | Number of finality events waiting for a worker, including EnqueueBlocking callers blocked on a full buffer, so it can exceed the queue size
 panurus_services_network_fabricx_finality_queue_finality_queue_processing_duration_seconds | histogram | - | token/services/network/fabricx/finality/queue/metrics.go | Histogram of successful event processing time in worker goroutines (seconds)
 panurus_services_network_fabricx_finality_queue_finality_queue_processing_errors_total | counter | - | token/services/network/fabricx/finality/queue/metrics.go | Total number of errors returned by event.Process in worker goroutines
 panurus_services_selector_ratelimit_buckets_active | gauge | - | token/services/selector/ratelimit/metrics.go | Number of live per-wallet buckets held by the token selection rate limiter
@@ -72,3 +72,7 @@ panurus_services_utils_json_session_ttx_envelope_body_bytes | histogram | type |
 panurus_services_utils_json_session_ttx_envelope_errors_total | counter | error | token/services/utils/json/session/metrics.go | Total number of envelope validation errors
 panurus_services_utils_json_session_ttx_envelope_received_total | counter | version,type | token/services/utils/json/session/metrics.go | Total number of versioned envelopes received
 panurus_services_utils_json_session_ttx_envelope_sent_total | counter | version,type | token/services/utils/json/session/metrics.go | Total number of versioned envelopes sent
+panurus_storage_db_pool_in_use | gauge | pool | token/services/storage/db/sql/dbpool/metrics.go | Number of connections currently checked out of the pool
+panurus_storage_db_pool_max_open | gauge | pool | token/services/storage/db/sql/dbpool/metrics.go | Configured maximum number of open connections for the pool
+panurus_storage_db_pool_wait_count_total | counter | pool | token/services/storage/db/sql/dbpool/metrics.go | Total number of connection checkouts that had to wait because the pool was at its connection limit
+panurus_storage_db_pool_wait_seconds_total | counter | pool | token/services/storage/db/sql/dbpool/metrics.go | Total time, in seconds, callers spent waiting for a connection to become available

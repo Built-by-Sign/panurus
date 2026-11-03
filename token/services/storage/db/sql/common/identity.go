@@ -774,18 +774,16 @@ func (db *IdentityStore) storeSignerInfo(ctx context.Context, tx dbTransaction, 
 	query, args := q.InsertInto(db.table.Signers).
 		Fields("identity_hash", "identity", "info").
 		Row(h, id, info).
+		OnConflictDoNothing().
 		Format()
 
 	logging.Debug(logger, query, h, utils.Hashable(info))
-	exists := false
-	_, err := tx.ExecContext(ctx, query, args...)
+	exists, err := insertedNothing(tx.ExecContext(ctx, query, args...))
 	if err != nil {
-		if errors.Is(db.errorWrapper.WrapError(err), driver2.UniqueKeyViolation) {
-			logger.DebugfContext(ctx, "signer info [%s] exists, no error to return", h)
-			exists = true
-		} else {
-			return exists, err
-		}
+		return false, err
+	}
+	if exists {
+		logger.DebugfContext(ctx, "signer info [%s] exists, no error to return", h)
 	}
 	if updateCache {
 		db.signerInfoCache.Add(h, true)
@@ -804,16 +802,16 @@ func (db *IdentityStore) storeIdentityData(ctx context.Context, tx dbTransaction
 	query, args := q.InsertInto(db.table.IdentityInfo).
 		Fields("identity_hash", "identity", "identity_audit_info", "token_metadata", "token_metadata_audit_info").
 		Row(h, id, identityAudit, tokenMetadata, tokenMetadataAudit).
+		OnConflictDoNothing().
 		Format()
 	logging.Debug(logger, query, args)
 
-	exists := false
-	if _, err := tx.ExecContext(ctx, query, args...); err != nil {
-		if !errors.Is(db.errorWrapper.WrapError(err), driver2.UniqueKeyViolation) {
-			return exists, err
-		}
+	exists, err := insertedNothing(tx.ExecContext(ctx, query, args...))
+	if err != nil {
+		return false, err
+	}
+	if exists {
 		logger.DebugfContext(ctx, "identity data [%s] exists, no error to return", h)
-		exists = true
 	}
 
 	if updateCache {
@@ -824,4 +822,18 @@ func (db *IdentityStore) storeIdentityData(ctx context.Context, tx dbTransaction
 	logger.DebugfContext(ctx, "store identity data for [%s] done", h)
 
 	return exists, nil
+}
+
+// insertedNothing reports whether an INSERT ... ON CONFLICT DO NOTHING skipped its row
+// because the key was already present.
+func insertedNothing(res sql.Result, err error) (bool, error) {
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, errors.Wrap(err, "failed to read affected rows")
+	}
+
+	return n == 0, nil
 }

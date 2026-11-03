@@ -329,6 +329,17 @@ graph LR
     Notify3 --> App
 ```
 
+### Submit-Path Finality Wait
+
+Besides the async queue above, the submitter
+(`token/services/network/fabricx/tms`) also waits for finality inline on
+broadcast. Polling starts before the ordering call, so a transaction committing
+early is not missed, and is cancelled if the broadcast fails.
+
+Only `io.EOF` is retried (block 0 not yet committed, typical at startup):
+`finalityEOFRetries` (5) attempts, `finalityRetryDuration` (2s) apart. Any other
+error returns immediately.
+
 ### Finality Configuration
 
 ```yaml
@@ -404,6 +415,27 @@ If the read fails, or the parameters are not on the ledger yet, the keeper stays
 unsynchronized: `GetVersion` returns the error to the caller (so the endorsement
 fails loudly instead of producing a transaction that is silently rejected later)
 and retries on the next call.
+
+### Deploying the Public Parameters
+
+The first setup transaction on a namespace is written by
+[`tms.DeployerService`](../../token/services/network/fabricx/tms/deployer.go).
+`DeployTMSs` and `DeployTMS` read the parameters from the file at each TMS's
+`publicParameters.path`, not from the ledger, which holds nothing yet on a namespace
+that was never initialized. `DeployTMSWithPP` deploys the bytes it is given instead.
+All three refuse empty parameters: committing an empty setup key would leave the
+namespace unusable for every later token operation.
+
+```yaml
+token:
+  tms:
+    mytms:
+      network: mynet
+      channel: ""
+      namespace: token
+      publicParameters:
+        path: /path/to/zkatdlognoghv1_pp.json
+```
 
 ### Version Keeper Configuration
 

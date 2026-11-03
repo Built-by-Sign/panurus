@@ -11,8 +11,8 @@ require (
 	github.com/LFDT-Panurus/panurus/x/token/services/network/evm v0.0.0
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.1
 	github.com/gin-gonic/gin v1.12.0
-	github.com/hyperledger-labs/fabric-smart-client v0.26.0
-	github.com/hyperledger-labs/fabric-smart-client/integration v0.26.0
+	github.com/hyperledger-labs/fabric-smart-client v0.27.0
+	github.com/hyperledger-labs/fabric-smart-client/integration v0.27.0
 	github.com/hyperledger/fabric-lib-go v1.1.5
 	github.com/moby/moby/api v1.56.1
 	github.com/moby/moby/client v0.6.2
@@ -91,8 +91,8 @@ require (
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.32.0 // indirect
 	github.com/hashicorp/golang-lru v1.0.2 // indirect
 	github.com/huin/goupnp v1.3.0 // indirect
-	github.com/hyperledger-labs/fabric-smart-client/platform/fabric/services/state/cc/query v0.25.0 // indirect
-	github.com/hyperledger-labs/fabric-smart-client/platform/view/services/comm/host/libp2p v0.25.0 // indirect
+	github.com/hyperledger-labs/fabric-smart-client/platform/fabric/services/state/cc/query v0.27.0 // indirect
+	github.com/hyperledger-labs/fabric-smart-client/platform/view/services/comm/host/libp2p v0.27.0 // indirect
 	github.com/hyperledger/fabric-amcl v0.0.0-20230602173724-9e02669dceb2 // indirect
 	github.com/hyperledger/fabric-chaincode-go/v2 v2.3.1-0.20260831054443-83a556592560 // indirect
 	github.com/hyperledger/fabric-protos-go-apiv2 v0.3.7 // indirect
@@ -128,7 +128,7 @@ require (
 	github.com/libp2p/go-buffer-pool v0.1.0 // indirect
 	github.com/libp2p/go-cidranger v1.1.0 // indirect
 	github.com/libp2p/go-flow-metrics v0.3.0 // indirect
-	github.com/libp2p/go-libp2p v0.50.0 // indirect
+	github.com/libp2p/go-libp2p v0.51.0 // indirect
 	github.com/libp2p/go-libp2p-asn-util v0.4.1 // indirect
 	github.com/libp2p/go-libp2p-kad-dht v0.42.2 // indirect
 	github.com/libp2p/go-libp2p-kbucket v0.9.0 // indirect
@@ -230,7 +230,7 @@ require (
 	golang.org/x/crypto v0.58.0 // indirect
 	golang.org/x/exp v0.0.0-20261014143641-f0251eb4aa3e // indirect
 	golang.org/x/mod v0.42.0 // indirect
-	golang.org/x/net v0.61.0 // indirect
+	golang.org/x/net v0.62.0 // indirect
 	golang.org/x/sync v0.24.0 // indirect
 	golang.org/x/sys v0.49.0 // indirect
 	golang.org/x/telemetry v0.0.0-20261020154912-7bf0a11256d5 // indirect
@@ -240,7 +240,7 @@ require (
 	gonum.org/v1/gonum v0.17.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20261019180522-ce908d29299b // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20261019180522-ce908d29299b // indirect
-	google.golang.org/grpc v1.84.0 // indirect
+	google.golang.org/grpc v1.85.0 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
 	lukechampine.com/blake3 v1.4.1 // indirect
 	modernc.org/libc v1.79.0 // indirect

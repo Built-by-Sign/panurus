@@ -812,10 +812,15 @@ TMS's TokenState at the same time and takes the first one that knows the anchor.
 a fresh random nonce, so at most one of them can have applied a given transaction. `ctx` bounds all of
 those reads: cancelling it aborts whichever are still in flight.
 
-This node's own role as an endorser (`endorser.enabled`, `endorser.keystore`, `endorser.address`) is the
-one thing that stays node-wide rather than per TMS, because FSC can register only one endorsement
-responder per process (see `registerEndorser`'s doc comment in `driver.go`). If more than one TMS on the
-network enables endorsing, they must all name the same key; the driver refuses to start otherwise.
+This node's endorser key (`endorser.keystore`, `endorser.address`) is the one thing that stays node-wide
+rather than per TMS, because FSC can register only one endorsement responder per process (see
+`registerEndorser`'s doc comment in `driver.go`). If more than one TMS on the network enables endorsing,
+they must all use the same key; the driver refuses to start otherwise. Keys are compared by address, so
+the same key reached through two different keystore paths is fine.
+
+Which requesters are admitted is per TMS. The one responder checks each request against the
+`endorsement.allowlist` of the TMS the request names, and refuses a request for a TMS that does not set
+`endorser.enabled`, even when another TMS on the network made this node an endorser.
 
 ### How finality resolves
 
@@ -852,6 +857,11 @@ emits `StateCommitted`, and log scanning by anchor can only ever discover succes
 not a tuning knob. It has to exceed both the chain's real time-to-finality at the configured block tag
 and the longest gap an application leaves between preparing a transaction and broadcasting it — otherwise
 recovery condemns transactions that were merely slow to submit, not ones that were rejected.
+
+The ttx finality views (`NewFinalityView`, `NewOrderingAndFinalityView`) wait 5 and 10 minutes by default,
+less than the 13-minute minimum for `finalized`. When the caller sets no timeout, they ask the network for
+its finality timeout (`driver.FinalityTimeoutProvider`) and wait that long plus a minute instead, so they
+see the driver's verdict rather than give up first. An explicit timeout is used as given.
 
 ### Error classification
 
@@ -977,6 +987,15 @@ manager counts locally, so two nodes sharing an account will reuse a consumed no
 Anything else spending from that account — an administrative parameters update, for instance — moves the
 nodes' nonces behind their backs in the same way. Keep a separate operator account for deployment and
 administrative submissions.
+
+The local count can also run ahead of the chain with no error: a transaction the node accepted can leave
+its pool unmined (evicted, or lost in a node restart, since the pool is not persisted), and every later
+nonce then queues behind the hole. The nonce manager reads the node's pending nonce again at most every
+10 seconds, and if it stays below the local count for 30 seconds it reuses that nonce to fill the hole,
+then re-reads the chain so the transactions that were queued are not issued again. The 30 seconds keep a
+replica behind a load balancer that has not seen the latest broadcast yet from causing a live transaction
+to be replaced. Each read of the pending nonce gives up after 5 seconds, since it runs while every other
+submission on the account waits.
 
 ### Node compatibility
 
