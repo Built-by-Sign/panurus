@@ -169,6 +169,15 @@ func (db *TokenStore) DeleteTokens(ctx context.Context, deletedBy string, ids ..
 		return errors.Wrapf(err, "error setting tokens to deleted [%v]", ids)
 	}
 
+	query, args = q.Update(db.table.Ownership).
+		Set("spent", true).
+		Where(HasTokens("tx_id", "idx", ids...)).
+		Format(db.ci)
+	logging.Debug(logger, query, args)
+	if _, err := db.writeDB.ExecContext(ctx, query, args...); err != nil {
+		return errors.Wrapf(err, "error setting ownerships to spent [%v]", ids)
+	}
+
 	return nil
 }
 
@@ -268,6 +277,7 @@ func buildUnspentTokensIteratorByQuery(db *TokenStore, walletID string, tokenTyp
 		cond.Eq("owner", true),
 		cond.Eq("is_deleted", false),
 		cond.Eq("wallet_id", walletID),
+		cond.Eq("spent", false),
 	}
 	if len(tokenType) > 0 {
 		branch2Conds = append(branch2Conds, cond.Eq("token_type", tokenType))
@@ -1702,10 +1712,12 @@ func (db *TokenStore) GetSchema() string {
 			tx_id TEXT NOT NULL,
 			idx INT NOT NULL,
 			wallet_id TEXT NOT NULL,
+			spent BOOLEAN NOT NULL DEFAULT false,
 			PRIMARY KEY (tx_id, idx, wallet_id),
 			FOREIGN KEY (tx_id, idx) REFERENCES %s
 		);
 		CREATE INDEX IF NOT EXISTS idx_wallet_id_%s ON %s ( wallet_id );
+		CREATE INDEX IF NOT EXISTS idx_wallet_unspent_%s ON %s ( wallet_id ) WHERE spent = false;
 
 		-- Public Parameters
 		CREATE TABLE IF NOT EXISTS %s (
@@ -1744,7 +1756,7 @@ func (db *TokenStore) GetSchema() string {
 		db.table.Tokens, db.table.Tokens,
 		db.table.Tokens, db.table.Tokens,
 		db.table.Tokens, db.table.Tokens,
-		db.table.Ownership, db.table.Tokens, db.table.Ownership, db.table.Ownership,
+		db.table.Ownership, db.table.Tokens, db.table.Ownership, db.table.Ownership, db.table.Ownership, db.table.Ownership,
 		db.table.PublicParams, db.table.PublicParams, db.table.PublicParams,
 		db.table.Certifications, db.table.Tokens,
 		db.table.TokenSKICleanups, db.table.Tokens, db.table.TokenSKICleanups, db.table.TokenSKICleanups,
@@ -1897,7 +1909,7 @@ func (t *TokenTransaction) GetToken(ctx context.Context, tokenID token.ID, inclu
 }
 
 func (t *TokenTransaction) Delete(ctx context.Context, tokenID token.ID, deletedBy string) error {
-	// We don't delete audit tokens, and we keep the 'ownership' relation.
+	// We don't delete audit tokens, and we keep the 'ownership' relation, marked spent.
 	query, args := q.Update(t.table.Tokens).
 		Set("is_deleted", true).
 		Set("spent_by", deletedBy).
@@ -1909,6 +1921,15 @@ func (t *TokenTransaction) Delete(ctx context.Context, tokenID token.ID, deleted
 
 	if _, err := t.tx.ExecContext(ctx, query, args...); err != nil {
 		return errors.Wrapf(err, "error setting token to deleted [%s]", tokenID.TxId)
+	}
+
+	query, args = q.Update(t.table.Ownership).
+		Set("spent", true).
+		Where(cond.And(cond.Eq("tx_id", tokenID.TxId), cond.Eq("idx", tokenID.Index))).
+		Format(t.ci)
+	logging.Debug(logger, query, args)
+	if _, err := t.tx.ExecContext(ctx, query, args...); err != nil {
+		return errors.Wrapf(err, "error setting ownership to spent [%s]", tokenID.TxId)
 	}
 
 	return nil
