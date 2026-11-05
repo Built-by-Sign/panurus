@@ -30,6 +30,9 @@ import (
 	"github.com/hyperledger-labs/fabric-smart-client/platform/view/view"
 )
 
+// IdentityCacheSize is the capacity of the identity store's signer-info and identity-config caches.
+const IdentityCacheSize = 100000
+
 type cache[T any] interface {
 	Get(key string) (T, bool)
 	GetOrLoad(key string, loader func() (T, error)) (T, bool, error)
@@ -102,8 +105,8 @@ func NewCachedIdentityStore(
 		readDB,
 		writeDB,
 		tables,
-		cache2.NewSecondChanceCache[bool](5000, 1),
-		cache2.NewSecondChanceCache[[]byte](5000, 1),
+		cache2.NewSecondChanceCache[bool](IdentityCacheSize, 1),
+		cache2.NewSecondChanceCache[[]byte](IdentityCacheSize, 1),
 		ci,
 		errorWrapper,
 	)
