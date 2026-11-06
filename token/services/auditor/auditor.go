@@ -283,7 +283,11 @@ func isRetriableLockError(ctx context.Context, err error) bool {
 func (a *Service) Append(ctx context.Context, tx Transaction) error {
 	start := time.Now()
 	defer func() { a.metrics.AppendDuration.Observe(time.Since(start).Seconds()) }()
-	defer a.Release(ctx, tx)
+	defer func() {
+		rctx, span := appendSpan(ctx, "auditor_release")
+		a.Release(rctx, tx)
+		span.End()
+	}()
 
 	request := tx.Request()
 	tms, err := a.bindProviderTMS(request)
@@ -312,11 +316,16 @@ func (a *Service) Append(ctx context.Context, tx Transaction) error {
 		// and the vault is not read a second time
 		wrapper.cached = record
 	}
-	if err := a.auditDB.Append(ctx, wrapper); err != nil {
+	dbCtx, dbSpan := appendSpan(ctx, "auditor_db_append")
+	err = a.auditDB.Append(dbCtx, wrapper)
+	dbSpan.End()
+	if err != nil {
 		a.metrics.AppendErrors.Add(1)
 
 		return errors.WithMessagef(err, "failed appending request %s", tx.ID())
 	}
+	_, flSpan := appendSpan(ctx, "auditor_add_finality_listener")
+	defer flSpan.End()
 
 	// lister to events
 	net, err := a.networkProvider.GetNetwork(tx.Network(), tx.Channel())
@@ -345,6 +354,11 @@ func (a *Service) Append(ctx context.Context, tx Transaction) error {
 	logger.DebugfContext(ctx, "append done for request [%s]", tx.ID())
 
 	return nil
+}
+
+// appendSpan starts a child span of the caller's span for one Append step.
+func appendSpan(ctx context.Context, name string) (context.Context, trace.Span) {
+	return trace.SpanFromContext(ctx).TracerProvider().Tracer("panurus/auditor").Start(ctx, name)
 }
 
 // bindProviderTMS resolves the TMS for the service's TMS ID through the
