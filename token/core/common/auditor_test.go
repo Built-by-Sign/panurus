@@ -240,9 +240,29 @@ func TestRetrieveAuditTokens(t *testing.T) {
 		assert.Equal(t, 2, qe.ListAuditTokensCallCount())
 	})
 
+	t.Run("ProducerCommitsBetweenLookupAndPendingCheck", func(t *testing.T) {
+		// The producing tx commits after the first lookup misses but before the
+		// pending check runs: it is no longer pending, and its token is now
+		// readable, so the lookup must be repeated instead of failing.
+		qe := &mock.QueryEngine{}
+		id1 := &token.ID{TxId: "tx1", Index: 1}
+		tokenIDs := []*token.ID{id1}
+
+		tok1 := &token.Token{Type: "USD", Quantity: "100"}
+		qe.ListAuditTokensReturnsOnCall(0, nil, errors.New("token not found for key [tx1:1]"))
+		qe.ListAuditTokensReturnsOnCall(1, []*token.Token{tok1}, nil)
+		qe.IsPendingReturns(false, nil)
+
+		tokens, err := RetrieveAuditTokens(ctx, logger, qe, tokenIDs, anchor, testNumRetries, testRetryDelay)
+		require.NoError(t, err)
+		assert.Equal(t, tok1, tokens[id1.String()])
+		assert.Equal(t, 2, qe.ListAuditTokensCallCount())
+	})
+
 	t.Run("NoRetryWhenNotPending", func(t *testing.T) {
 		// A genuine failure (no requested token is pending) must fail fast,
-		// without spending the retry budget.
+		// without spending the retry budget: one lookup plus one confirming
+		// re-read, no retry delay.
 		qe := &mock.QueryEngine{}
 		id1 := &token.ID{TxId: "tx1", Index: 0}
 		tokenIDs := []*token.ID{id1}
@@ -253,7 +273,7 @@ func TestRetrieveAuditTokens(t *testing.T) {
 		tokens, err := RetrieveAuditTokens(ctx, logger, qe, tokenIDs, anchor, testNumRetries, testRetryDelay)
 		require.Error(t, err)
 		assert.Nil(t, tokens)
-		assert.Equal(t, 1, qe.ListAuditTokensCallCount())
+		assert.Equal(t, 2, qe.ListAuditTokensCallCount())
 	})
 
 	t.Run("ExhaustsRetriesWhileStillPending", func(t *testing.T) {
@@ -330,7 +350,8 @@ func TestRetrieveAuditTokens(t *testing.T) {
 		tokens, err := RetrieveAuditTokens(ctx, logger, qe, tokenIDs, anchor, 0, testRetryDelay)
 		require.Error(t, err)
 		assert.Nil(t, tokens)
-		assert.Equal(t, 1, qe.ListAuditTokensCallCount())
+		// one attempt plus the confirming re-read of a non-pending miss
+		assert.Equal(t, 2, qe.ListAuditTokensCallCount())
 	})
 }
 

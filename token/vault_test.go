@@ -102,6 +102,29 @@ func TestQueryEngine_ListAuditTokens_IsPendingTrue(t *testing.T) {
 	assert.Equal(t, 2, mockQE.ListAuditTokensCallCount())
 }
 
+// TestQueryEngine_ListAuditTokens_CommittedBeforePendingCheck verifies that a token whose producing
+// transaction commits between the lookup and the pending check is read again rather than reported missing.
+func TestQueryEngine_ListAuditTokens_CommittedBeforePendingCheck(t *testing.T) {
+	ctx := t.Context()
+	mockQE := &mock.QueryEngine{}
+	expectedIDs := []*token.ID{{TxId: "a_transaction", Index: 1}}
+	expectedTokens := []*token.Token{{
+		Owner:    []byte("some_owner"),
+		Type:     "some_type",
+		Quantity: "some_quantity",
+	}}
+	mockQE.ListAuditTokensReturnsOnCall(0, nil, errors.New("token not found for key [a_transaction:1]"))
+	mockQE.ListAuditTokensReturnsOnCall(1, expectedTokens, nil)
+	mockQE.IsPendingReturns(false, nil)
+
+	queryEngine := NewQueryEngine(logging.MustGetLogger(), mockQE, 3, time.Second)
+	tokens, err := queryEngine.ListAuditTokens(ctx, expectedIDs...)
+
+	require.NoError(t, err)
+	assert.Equal(t, expectedTokens, tokens)
+	assert.Equal(t, 2, mockQE.ListAuditTokensCallCount())
+}
+
 // TestQueryEngine_ListAuditTokens_IsPendingTrueNumRetries verifies retry logic for pending audit tokens
 func TestQueryEngine_ListAuditTokens_IsPendingTrueNumRetries(t *testing.T) {
 	ctx := t.Context()

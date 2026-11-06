@@ -395,7 +395,13 @@ func listAuditTokensWithRetry(
 		}
 
 		if !retry {
-			// None of the tokens is pending: this is a genuine failure, do not retry.
+			// None of the tokens is pending. The producing transaction may have
+			// committed between the lookup and the pending check, so read once more
+			// before treating the miss as genuine.
+			if tokens, err = queryEngine.ListAuditTokens(ctx, tokenIDs...); err == nil {
+				return tokens, nil
+			}
+
 			return nil, err
 		}
 

@@ -109,6 +109,13 @@ func (q *QueryEngine) ListAuditTokens(ctx context.Context, ids ...*token.ID) ([]
 				continue
 			}
 
+			// None of the tokens is pending. The producing transaction may have
+			// committed between the lookup and the pending check, so read once more
+			// before treating the miss as genuine.
+			if tokens, err = q.qe.ListAuditTokens(ctx, ids...); err == nil {
+				return tokens, nil
+			}
+
 			return nil, errors.Wrapf(err, "failed to get audit tokens")
 		}
 
