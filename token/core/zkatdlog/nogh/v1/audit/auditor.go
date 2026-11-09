@@ -306,7 +306,13 @@ func validateTransferValues(metadata *driver.TransferMetadata, auditTokens map[s
 	inSum := new(big.Int)
 	var inType token2.Type
 	for i, in := range metadata.Inputs {
+		if in == nil || in.TokenID == nil {
+			return errors.Errorf("input at index [%d] has no token ID", i)
+		}
 		tok := auditTokens[in.TokenID.String()]
+		if tok == nil {
+			return errors.Errorf("input token [%s] at index [%d] not found in audit tokens", in.TokenID, i)
+		}
 		q, err := token2.ToQuantity(tok.Quantity, precision)
 		if err != nil {
 			return errors.Wrapf(err, "invalid input quantity at index [%d]", i)
