@@ -72,6 +72,18 @@ type AuditService struct {
 	validateReturnsOnCall map[int]struct {
 		result1 error
 	}
+	ValidateWithoutProofsStub        func(context.Context, *token.Request) error
+	validateWithoutProofsMutex       sync.RWMutex
+	validateWithoutProofsArgsForCall []struct {
+		arg1 context.Context
+		arg2 *token.Request
+	}
+	validateWithoutProofsReturns struct {
+		result1 error
+	}
+	validateWithoutProofsReturnsOnCall map[int]struct {
+		result1 error
+	}
 	invocations      map[string][][]interface{}
 	invocationsMutex sync.RWMutex
 }
@@ -364,6 +376,68 @@ func (fake *AuditService) ValidateReturnsOnCall(i int, result1 error) {
 		})
 	}
 	fake.validateReturnsOnCall[i] = struct {
+		result1 error
+	}{result1}
+}
+
+func (fake *AuditService) ValidateWithoutProofs(arg1 context.Context, arg2 *token.Request) error {
+	fake.validateWithoutProofsMutex.Lock()
+	ret, specificReturn := fake.validateWithoutProofsReturnsOnCall[len(fake.validateWithoutProofsArgsForCall)]
+	fake.validateWithoutProofsArgsForCall = append(fake.validateWithoutProofsArgsForCall, struct {
+		arg1 context.Context
+		arg2 *token.Request
+	}{arg1, arg2})
+	stub := fake.ValidateWithoutProofsStub
+	fakeReturns := fake.validateWithoutProofsReturns
+	fake.recordInvocation("ValidateWithoutProofs", []interface{}{arg1, arg2})
+	fake.validateWithoutProofsMutex.Unlock()
+	if stub != nil {
+		return stub(arg1, arg2)
+	}
+	if specificReturn {
+		return ret.result1
+	}
+	return fakeReturns.result1
+}
+
+func (fake *AuditService) ValidateWithoutProofsCallCount() int {
+	fake.validateWithoutProofsMutex.RLock()
+	defer fake.validateWithoutProofsMutex.RUnlock()
+	return len(fake.validateWithoutProofsArgsForCall)
+}
+
+func (fake *AuditService) ValidateWithoutProofsCalls(stub func(context.Context, *token.Request) error) {
+	fake.validateWithoutProofsMutex.Lock()
+	defer fake.validateWithoutProofsMutex.Unlock()
+	fake.ValidateWithoutProofsStub = stub
+}
+
+func (fake *AuditService) ValidateWithoutProofsArgsForCall(i int) (context.Context, *token.Request) {
+	fake.validateWithoutProofsMutex.RLock()
+	defer fake.validateWithoutProofsMutex.RUnlock()
+	argsForCall := fake.validateWithoutProofsArgsForCall[i]
+	return argsForCall.arg1, argsForCall.arg2
+}
+
+func (fake *AuditService) ValidateWithoutProofsReturns(result1 error) {
+	fake.validateWithoutProofsMutex.Lock()
+	defer fake.validateWithoutProofsMutex.Unlock()
+	fake.ValidateWithoutProofsStub = nil
+	fake.validateWithoutProofsReturns = struct {
+		result1 error
+	}{result1}
+}
+
+func (fake *AuditService) ValidateWithoutProofsReturnsOnCall(i int, result1 error) {
+	fake.validateWithoutProofsMutex.Lock()
+	defer fake.validateWithoutProofsMutex.Unlock()
+	fake.ValidateWithoutProofsStub = nil
+	if fake.validateWithoutProofsReturnsOnCall == nil {
+		fake.validateWithoutProofsReturnsOnCall = make(map[int]struct {
+			result1 error
+		})
+	}
+	fake.validateWithoutProofsReturnsOnCall[i] = struct {
 		result1 error
 	}{result1}
 }

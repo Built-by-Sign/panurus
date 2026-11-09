@@ -1067,6 +1067,10 @@ func (r *Request) inputsAndOutputs(ctx context.Context, failOnMissing, verifyAct
 
 // IsValid validates the request structure and verifies all actions.
 func (r *Request) IsValid(ctx context.Context) error {
+	return r.isValid(ctx, true)
+}
+
+func (r *Request) isValid(ctx context.Context, verifyActions bool) error {
 	// check request fields
 	if r.TokenService == nil {
 		return errors.New("invalid token service in request")
@@ -1079,7 +1083,7 @@ func (r *Request) IsValid(ctx context.Context) error {
 	}
 
 	// check inputs, outputs, and verify actions
-	if _, _, _, err := r.inputsAndOutputs(ctx, false, true, false); err != nil {
+	if _, _, _, err := r.inputsAndOutputs(ctx, false, verifyActions, false); err != nil {
 		return errors.WithMessagef(err, "failed verifying inputs and outputs")
 	}
 
@@ -1415,8 +1419,19 @@ func (r *Request) Transfers() []*Transfer {
 
 // AuditCheck validates the request and performs auditor-specific checks.
 func (r *Request) AuditCheck(ctx context.Context) error {
+	return r.auditCheck(ctx, true)
+}
+
+// AuditCheckWithoutProofs is AuditCheck without verifying the actions' proofs.
+// It relies on the driver's auditor check to validate the cleartext values
+// (zkatdlog does); validators still verify the proofs before commit.
+func (r *Request) AuditCheckWithoutProofs(ctx context.Context) error {
+	return r.auditCheck(ctx, false)
+}
+
+func (r *Request) auditCheck(ctx context.Context, verifyProofs bool) error {
 	r.TokenService.logger.DebugfContext(ctx, "audit check request [%s] on tms [%s]", r.Anchor, r.TokenService.ID())
-	if err := r.IsValid(ctx); err != nil {
+	if err := r.isValid(ctx, verifyProofs); err != nil {
 		return err
 	}
 

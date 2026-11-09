@@ -1191,3 +1191,58 @@ func TestRequest_AuditRecord_OwnerAuditInfo(t *testing.T) {
 		assert.Equal(t, metadataAuditInfo, record.Inputs.At(0).OwnerAuditInfo)
 	})
 }
+
+// TestRequest_AuditCheckWithoutProofs checks that AuditCheckWithoutProofs skips
+// only the proof verification: the driver's auditor check still decides.
+func TestRequest_AuditCheckWithoutProofs(t *testing.T) {
+	ctx := t.Context()
+	newRequest := func(proofErr, auditorErr error) *Request {
+		transferAction := &driver2.TransferAction{}
+		transferAction.NumInputsReturns(1)
+		transferAction.NumOutputsReturns(0)
+		transferService := &driver2.TransferService{}
+		transferService.DeserializeTransferActionReturns(transferAction, nil)
+		transferService.VerifyTransferReturns(proofErr)
+		auditorService := &driver2.AuditorService{}
+		auditorService.AuditorCheckReturns(auditorErr)
+
+		pp := &driver2.PublicParameters{}
+		pp.PrecisionReturns(64)
+		ppm := &driver2.PublicParamsManager{}
+		ppm.PublicParametersReturns(pp)
+
+		tms := &driver2.TokenManagerService{}
+		tms.TransferServiceReturns(transferService)
+		tms.AuditorServiceReturns(auditorService)
+		tms.WalletServiceReturns(&driver2.WalletService{})
+		tms.PublicParamsManagerReturns(ppm)
+		logger := logging.MustGetLogger()
+
+		return &Request{
+			Anchor: "test-anchor",
+			Actions: &driver.TokenRequest{
+				Actions: []*driver.TypedAction{{Type: request.ActionType_ACTION_TYPE_TRANSFER, Raw: []byte("transfer1")}},
+			},
+			Metadata: &driver.TokenRequestMetadata{
+				Actions: []*driver.ActionMetadataEntry{{
+					ActionID: 0,
+					TransferMetadata: &driver.TransferMetadata{
+						Inputs: []*driver.TransferInputMetadata{{TokenID: &token.ID{TxId: "tx1", Index: 0}}},
+					},
+				}},
+			},
+			TokenService: &ManagementService{tms: tms, logger: logger, vault: &Vault{v: &driver2.Vault{}, logger: logger}},
+		}
+	}
+
+	t.Run("an invalid proof fails AuditCheck but not AuditCheckWithoutProofs", func(t *testing.T) {
+		req := newRequest(errors.New("invalid transfer proof"), nil)
+		require.ErrorContains(t, req.AuditCheck(ctx), "invalid transfer proof")
+		require.NoError(t, req.AuditCheckWithoutProofs(ctx))
+	})
+
+	t.Run("the auditor check still rejects without proofs", func(t *testing.T) {
+		req := newRequest(nil, errors.New("outputs do not sum to inputs"))
+		require.ErrorContains(t, req.AuditCheckWithoutProofs(ctx), "outputs do not sum to inputs")
+	})
+}

@@ -137,6 +137,12 @@ func (a *Service) Validate(ctx context.Context, request *token.Request) error {
 	return request.AuditCheck(ctx)
 }
 
+// ValidateWithoutProofs is Validate without verifying the request's proofs; see
+// token.Request.AuditCheckWithoutProofs.
+func (a *Service) ValidateWithoutProofs(ctx context.Context, request *token.Request) error {
+	return request.AuditCheckWithoutProofs(ctx)
+}
+
 // Audit extracts the list of inputs and outputs from the passed transaction.
 // In addition, the Audit locks the enrollment named ids with retry logic and exponential backoff
 // to prevent livelock conditions.

@@ -26,6 +26,7 @@ var (
 // Service models the auditor service
 type Service interface {
 	Validate(ctx context.Context, request *token.Request) error
+	ValidateWithoutProofs(ctx context.Context, request *token.Request) error
 	Audit(ctx context.Context, tx auditor.Transaction) (*token.InputStream, *token.OutputStream, error)
 	Release(ctx context.Context, tx auditor.Transaction)
 	GetTokenRequest(ctx context.Context, id string) ([]byte, error)

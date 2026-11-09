@@ -61,6 +61,12 @@ func (a *Auditor) Validate(ctx context.Context, tx *Transaction) error {
 	return a.Service.Validate(ctx, tx.TokenRequest)
 }
 
+// ValidateWithoutProofs is Validate without verifying the transaction's proofs;
+// see token.Request.AuditCheckWithoutProofs.
+func (a *Auditor) ValidateWithoutProofs(ctx context.Context, tx *Transaction) error {
+	return a.Service.ValidateWithoutProofs(ctx, tx.TokenRequest)
+}
+
 // Audit extracts the list of inputs and outputs from the passed transaction.
 // In addition, Audit acquires locks on the enrollment IDs involved in the transaction.
 // The caller MUST call Release() to unlock these enrollment IDs after processing.
