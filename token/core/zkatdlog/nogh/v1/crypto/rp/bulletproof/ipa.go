@@ -129,6 +129,10 @@ const maxIPARounds = 16
 
 // ipaProver manages the creation of an inner product argument proof.
 type ipaProver struct {
+	// rightWeights, when set, scales the right basis: the effective generator i is
+	// RightGenerators[i]^rightWeights[i]. The transcript absorbs the unweighted
+	// generators, so the weights must be bound by the transcript already.
+	rightWeights []*mathlib.Zr
 	// rightVector is the first vector of the inner product.
 	rightVector []*mathlib.Zr
 	// leftVector is the second vector of the inner product.
@@ -231,6 +235,14 @@ func (p *ipaProver) Prove() (*IPA, error) {
 	return &IPA{Left: left, Right: right, R: RArray, L: LArray}, nil
 }
 
+// rightWeighted multiplies a scalar of right generator i by its weight, if any.
+func (p *ipaProver) rightWeighted(scalar *mathlib.Zr, i int) *mathlib.Zr {
+	if p.rightWeights == nil {
+		return scalar
+	}
+	return p.Curve.ModMul(scalar, p.rightWeights[i], p.Curve.GroupOrder)
+}
+
 // reduce returns two values left and right such that left is a function
 // of the left vector and right is a function of right vector.
 // Both vectors are committed in com which is passed as a parameter to reduce
@@ -270,7 +282,7 @@ func (p *ipaProver) reduce(X, com *mathlib.G1) (*mathlib.Zr, *mathlib.Zr, []*mat
 				pointsL = append(pointsL, p.LeftGenerators[idxG_R], p.RightGenerators[idxH_L])
 				scalarsL = append(scalarsL,
 					p.Curve.ModMul(left[j], s[m], p.Curve.GroupOrder),
-					p.Curve.ModMul(right[n_current+j], sInv[m], p.Curve.GroupOrder),
+					p.rightWeighted(p.Curve.ModMul(right[n_current+j], sInv[m], p.Curve.GroupOrder), idxH_L),
 				)
 
 				idxG_L := j + 2*m*n_current
@@ -279,7 +291,7 @@ func (p *ipaProver) reduce(X, com *mathlib.G1) (*mathlib.Zr, *mathlib.Zr, []*mat
 				pointsR = append(pointsR, p.LeftGenerators[idxG_L], p.RightGenerators[idxH_R])
 				scalarsR = append(scalarsR,
 					p.Curve.ModMul(left[n_current+j], s[m], p.Curve.GroupOrder),
-					p.Curve.ModMul(right[j], sInv[m], p.Curve.GroupOrder),
+					p.rightWeighted(p.Curve.ModMul(right[j], sInv[m], p.Curve.GroupOrder), idxH_R),
 				)
 			}
 		}
@@ -328,6 +340,8 @@ func (p *ipaProver) reduce(X, com *mathlib.G1) (*mathlib.Zr, *mathlib.Zr, []*mat
 
 // ipaVerifier manages the verification of an inner product argument proof.
 type ipaVerifier struct {
+	// rightWeights mirrors ipaProver.rightWeights.
+	rightWeights []*mathlib.Zr
 	// InnerProduct is the value being verified.
 	InnerProduct *mathlib.Zr
 	// Q is an auxiliary generator.
@@ -467,6 +481,9 @@ func (v *ipaVerifier) Verify(proof *IPA) error {
 	for i := range s {
 		s[i] = v.Curve.ModMul(s[i], proof.Left, v.Curve.GroupOrder)
 		sInv[i] = v.Curve.ModMul(sInv[i], proof.Right, v.Curve.GroupOrder)
+		if v.rightWeights != nil {
+			sInv[i] = v.Curve.ModMul(sInv[i], v.rightWeights[i], v.Curve.GroupOrder)
+		}
 	}
 	idx := 0
 	copy(generators[idx:], leftGen)

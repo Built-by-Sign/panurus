@@ -288,19 +288,20 @@ func nativeRPVerifyIPA[T any, E math2.GnarkFr[T]](v *rangeVerifier, rp *RangePro
 	var tmp2E T
 
 	for i := range n {
-		// zi = z * y^i + z^2 * 2^i
+		// zi = (z * y^i + z^2 * 2^i) / y^i: the 1/y^i folds H'_i = H_i^{1/y^i}
+		// into the scalar of H_i instead of computing H' (see rangeProver.Prove).
 		E(&tmpE).Mul(zE, E(&yPowE[i]))
 		E(&tmp2E).Mul(zSquareE, E(&twoPowE))
 		E(&tmpE).Add(E(&tmpE), E(&tmp2E))
+		E(&tmpE).Mul(E(&tmpE), yInv[i])
 
 		ziScalars[i] = math2.NativeToZr[T, E](E(&tmpE), v.Curve)
 		E(&twoPowE).Mul(E(&twoPowE), E(&twoE))
 	}
 
-	rightGeneratorsPrime := make([]*math.G1, n)
+	yInvZr := make([]*math.Zr, n)
 	for i := range n {
-		yInvZr := math2.NativeToZr[T, E](yInv[i], v.Curve)
-		rightGeneratorsPrime[i] = v.RightGenerators[i].Mul(yInvZr)
+		yInvZr[i] = math2.NativeToZr[T, E](yInv[i], v.Curve)
 	}
 
 	var zNegE T
@@ -333,7 +334,7 @@ func nativeRPVerifyIPA[T any, E math2.GnarkFr[T]](v *rangeVerifier, rp *RangePro
 	}
 
 	for i := range n {
-		allPoints = append(allPoints, rightGeneratorsPrime[i])
+		allPoints = append(allPoints, v.RightGenerators[i])
 		allScalars = append(allScalars, ziScalars[i])
 	}
 
@@ -346,13 +347,14 @@ func nativeRPVerifyIPA[T any, E math2.GnarkFr[T]](v *rangeVerifier, rp *RangePro
 		rp.Data.InnerProduct,
 		v.Q,
 		v.LeftGenerators,
-		rightGeneratorsPrime,
+		v.RightGenerators,
 		com,
 		v.NumberOfRounds,
 		v.Curve,
 		tr,
 		v.Provider,
 	)
+	ipv.rightWeights = yInvZr
 
 	return ipv.Verify(rp.IPA)
 }

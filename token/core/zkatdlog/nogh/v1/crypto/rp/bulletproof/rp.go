@@ -280,16 +280,18 @@ func (p *rangeProver) Prove() (*RangeProof, error) {
 	yInv := y.Copy()
 	yInv.InvModOrder()
 
-	rightGeneratorsPrime := make([]*math.G1, len(p.RightGenerators))
+	// The IPA runs over H'_i = H_i^{1/y^i}; fold 1/y^i into the scalars instead of
+	// computing H'. y is bound by the transcript, so H' stays bound too.
+	yInvPow := make([]*math.Zr, len(p.RightGenerators))
+	weightedRight := make([]*math.Zr, len(right))
 	yInv2i := math2.One(p.Curve)
 	for i := range len(p.RightGenerators) {
-		// compute the new generators H'_i = H_i^{1/y^i}
-		rightGeneratorsPrime[i] = p.RightGenerators[i].Mul(yInv2i)
-		// next power
+		yInvPow[i] = yInv2i
+		weightedRight[i] = p.Curve.ModMul(right[i], yInv2i, p.Curve.GroupOrder)
 		yInv2i = p.Curve.ModMul(yInv2i, yInv, p.Curve.GroupOrder)
 	}
 	// compute the commitment to left and right
-	com := CommitVector(left, right, p.LeftGenerators, rightGeneratorsPrime, p.Curve)
+	com := CommitVector(left, weightedRight, p.LeftGenerators, p.RightGenerators, p.Curve)
 	rp.Data.InnerProduct = math2.InnerProduct(left, right, p.Curve)
 	// produce the IPA, continuing the same transcript used for y, z, x, T1, T2 above so
 	// the IPA's own challenges are bound to the enclosing range proof's statement too.
@@ -299,13 +301,14 @@ func (p *rangeProver) Prove() (*RangeProof, error) {
 		right,
 		p.Q,
 		p.LeftGenerators,
-		rightGeneratorsPrime,
+		p.RightGenerators,
 		com,
 		p.NumberOfRounds,
 		p.Curve,
 		tr,
 		p.Provider,
 	)
+	ipp.rightWeights = yInvPow
 	rp.IPA, err = ipp.Prove()
 	if err != nil {
 		return nil, err
@@ -670,10 +673,10 @@ func (v *rangeVerifier) verifyIPA(rp *RangeProof, x *math.Zr, yPow []*math.Zr, z
 		)
 	}
 
-	// Compute rightGeneratorsPrime[i] = RightGenerators[i]^{1/y^i}.
-	rightGeneratorsPrime := make([]*math.G1, n)
+	// The IPA basis is H'_i = H_i^{1/y^i}: fold 1/y^i into the scalars of H_i
+	// instead of computing H' (see rangeProver.Prove).
 	for i := range n {
-		rightGeneratorsPrime[i] = v.RightGenerators[i].Mul(yInv[i])
+		ziScalars[i] = v.Curve.ModMul(ziScalars[i], yInv[i], v.Curve.GroupOrder)
 	}
 
 	// This is a linear combination of points with known scalars, exactly what
@@ -700,9 +703,9 @@ func (v *rangeVerifier) verifyIPA(rp *RangeProof, x *math.Zr, yPow []*math.Zr, z
 		allScalars = append(allScalars, zNeg)
 	}
 
-	// rightGenPrime[i]·zi
+	// RightGen[i]·zi/y^i
 	for i := range n {
-		allPoints = append(allPoints, rightGeneratorsPrime[i])
+		allPoints = append(allPoints, v.RightGenerators[i])
 		allScalars = append(allScalars, ziScalars[i])
 	}
 
@@ -718,13 +721,14 @@ func (v *rangeVerifier) verifyIPA(rp *RangeProof, x *math.Zr, yPow []*math.Zr, z
 		rp.Data.InnerProduct,
 		v.Q,
 		v.LeftGenerators,
-		rightGeneratorsPrime,
+		v.RightGenerators,
 		com,
 		v.NumberOfRounds,
 		v.Curve,
 		tr,
 		v.Provider,
 	)
+	ipv.rightWeights = yInv
 
 	return ipv.Verify(rp.IPA)
 }
