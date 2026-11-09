@@ -1103,6 +1103,9 @@ func commit(vector []*math.Zr, generators []*math.G1, c *math.Curve) *math.G1 {
 	return com
 }
 
+// inputQuantities are the cleartext values of the inputs built by createInputs.
+var inputQuantities = []string{"25", "35"}
+
 // buildAuditTokensFromInputs creates an auditTokens map from transfer inputs and metadata
 func buildAuditTokensFromInputs(t *testing.T, metadata *driver.TransferMetadata, inputs [][]*token.Token) map[string]*token3.Token {
 	t.Helper()
@@ -1118,7 +1121,7 @@ func buildAuditTokensFromInputs(t *testing.T, metadata *driver.TransferMetadata,
 			if tokenID != nil {
 				auditTokens[tokenID.String()] = &token3.Token{
 					Type:     "ABC",
-					Quantity: "0", // Placeholder - actual value not needed for these tests
+					Quantity: inputQuantities[i], // the values createInputs commits to
 					Owner:    tok.Owner,
 				}
 			}
@@ -1126,4 +1129,52 @@ func buildAuditTokensFromInputs(t *testing.T, metadata *driver.TransferMetadata,
 	}
 
 	return auditTokens
+}
+
+// TestAuditorCleartextValues covers the cleartext checks that stand in for the
+// transfer proof when the auditor does not verify it.
+func TestAuditorCleartextValues(t *testing.T) {
+	t.Run("outputs must sum to the inputs", func(t *testing.T) {
+		_, pp, auditor := setupAuditorTest(t)
+		transfer, metadata, inputs := createTransfer(t, pp)
+		raw, err := transfer.Serialize()
+		require.NoError(t, err)
+		auditTokens := buildAuditTokensFromInputs(t, metadata, inputs)
+		auditTokens[metadata.Inputs[1].TokenID.String()].Quantity = "36"
+
+		err = auditor.Check(
+			t.Context(),
+			&driver.TokenRequest{Actions: []*driver.TypedAction{{Type: request.ActionType_ACTION_TYPE_TRANSFER, Raw: raw}}},
+			&driver.TokenRequestMetadata{Actions: []*driver.ActionMetadataEntry{{ActionID: 0, TransferMetadata: metadata}}},
+			"1",
+			auditTokens,
+		)
+		require.ErrorContains(t, err, "transfer outputs sum [60] does not match inputs sum [61]")
+	})
+
+	t.Run("output values are bounded by the precision and typed like the inputs", func(t *testing.T) {
+		c := math.Curves[math.BN254]
+		out := func(typ token3.Type, v *math.Zr) *driver.TransferOutputMetadata {
+			raw, err := (&token.Metadata{Type: typ, Value: v, BlindingFactor: c.NewZrFromInt(7)}).Serialize()
+			require.NoError(t, err)
+			return &driver.TransferOutputMetadata{OutputMetadata: raw}
+		}
+		raw := func(o *driver.TransferOutputMetadata) []byte { return o.OutputMetadata }
+		maxValue := c.NewZrFromUint64(1<<16 - 1)
+
+		sum, err := audit.SumTransferOutputValues([]*driver.TransferOutputMetadata{out("ABC", maxValue), out("ABC", c.NewZrFromInt(1))}, raw, "ABC", 16)
+		require.NoError(t, err)
+		require.Equal(t, int64(1<<16), sum.Int64())
+
+		_, err = audit.SumTransferOutputValues([]*driver.TransferOutputMetadata{out("ABC", maxValue.Plus(c.NewZrFromInt(1)))}, raw, "ABC", 16)
+		require.ErrorContains(t, err, "output at index [0] value out of range for precision [16]")
+
+		neg := c.NewZrFromInt(1)
+		neg.Neg()
+		_, err = audit.SumTransferOutputValues([]*driver.TransferOutputMetadata{out("ABC", neg)}, raw, "ABC", 16)
+		require.ErrorContains(t, err, "output at index [0] value out of range for precision [16]")
+
+		_, err = audit.SumTransferOutputValues([]*driver.TransferOutputMetadata{out("ABC", c.NewZrFromInt(5)), out("XYZ", c.NewZrFromInt(5))}, raw, "ABC", 16)
+		require.ErrorContains(t, err, "output at index [1] has type [XYZ], inputs have [ABC]")
+	})
 }

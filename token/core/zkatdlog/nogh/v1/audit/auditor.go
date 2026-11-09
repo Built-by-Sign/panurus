@@ -9,6 +9,7 @@ package audit
 import (
 	"bytes"
 	"context"
+	"math/big"
 	"slices"
 
 	math "github.com/IBM/mathlib"
@@ -220,6 +221,9 @@ func IssueAuditValidate(infoMatcher InfoMatcher, pedersenParams []*math.G1, curv
 		if err := validateIssueOutputs(ctx, infoMatcher, pedersenParams, curve, action.Outputs, metadata.Outputs); err != nil {
 			return err
 		}
+		if _, err := sumOutputValues(metadata.Outputs, func(o *driver.IssueOutputMetadata) []byte { return o.OutputMetadata }, "", auditCtx.PP.Precision()); err != nil {
+			return err
+		}
 
 		// Validate that all inputs and outputs have the same token type
 		if err := common.ValidateIssueActionTokenTypes(metadata, auditCtx.AuditTokens); err != nil {
@@ -275,6 +279,9 @@ func TransferAuditValidate(infoMatcher InfoMatcher, pedersenParams []*math.G1, c
 		if err := common.ValidateTransferActionTokenTypes(metadata, auditCtx.AuditTokens, true, precision); err != nil {
 			return errors.Wrapf(err, "token type validation failed for transfer action")
 		}
+		if err := validateTransferValues(metadata, auditCtx.AuditTokens, precision); err != nil {
+			return err
+		}
 
 		// For redeems, validate that the issuer who approved the redeem is one of the issuers
 		// listed in the public parameters. The issuer is optional: when the public parameters do
@@ -290,6 +297,56 @@ func TransferAuditValidate(infoMatcher InfoMatcher, pedersenParams []*math.G1, c
 
 		return nil
 	}
+}
+
+// validateTransferValues checks on the audited cleartext what the transfer proof
+// asserts: outputs carry the inputs' token type, each value is below 2^precision,
+// and the outputs sum to the inputs.
+func validateTransferValues(metadata *driver.TransferMetadata, auditTokens map[string]*token2.Token, precision uint64) error {
+	inSum := new(big.Int)
+	var inType token2.Type
+	for i, in := range metadata.Inputs {
+		tok := auditTokens[in.TokenID.String()]
+		q, err := token2.ToQuantity(tok.Quantity, precision)
+		if err != nil {
+			return errors.Wrapf(err, "invalid input quantity at index [%d]", i)
+		}
+		inSum.Add(inSum, q.ToBigInt())
+		inType = tok.Type
+	}
+	outSum, err := sumOutputValues(metadata.Outputs, func(o *driver.TransferOutputMetadata) []byte { return o.OutputMetadata }, inType, precision)
+	if err != nil {
+		return err
+	}
+	if inSum.Cmp(outSum) != 0 {
+		return errors.Errorf("transfer outputs sum [%s] does not match inputs sum [%s]", outSum, inSum)
+	}
+	return nil
+}
+
+// sumOutputValues opens each output's token metadata, checks its value is below
+// 2^precision and, when wantType is set, its type, and returns the sum of values.
+func sumOutputValues[M any](outputs []M, raw func(M) []byte, wantType token2.Type, precision uint64) (*big.Int, error) {
+	limit := new(big.Int).Lsh(big.NewInt(1), uint(precision))
+	sum := new(big.Int)
+	for i, o := range outputs {
+		m := &token.Metadata{}
+		if err := m.Deserialize(raw(o)); err != nil {
+			return nil, errors.Wrapf(err, "failed to deserialize token metadata at index [%d]", i)
+		}
+		if wantType != "" && m.Type != wantType {
+			return nil, errors.Errorf("output at index [%d] has type [%s], inputs have [%s]", i, m.Type, wantType)
+		}
+		if m.Value == nil {
+			return nil, errors.Errorf("output at index [%d] has no value", i)
+		}
+		v := m.Value.BigInt()
+		if v.Sign() < 0 || v.Cmp(limit) >= 0 {
+			return nil, errors.Errorf("output at index [%d] value out of range for precision [%d]", i, precision)
+		}
+		sum.Add(sum, v)
+	}
+	return sum, nil
 }
 
 // validateRedeemIssuer checks that the issuer who approved a redeem is one of the issuers
