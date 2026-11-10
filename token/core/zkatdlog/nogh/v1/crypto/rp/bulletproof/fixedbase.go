@@ -13,6 +13,7 @@ import (
 	mathlib "github.com/IBM/mathlib"
 	math2 "github.com/LFDT-Panurus/panurus/token/core/zkatdlog/nogh/v1/crypto/math"
 	"github.com/consensys/gnark-crypto/ecc/bn254"
+	"github.com/consensys/gnark-crypto/ecc/bn254/fp"
 	"github.com/consensys/gnark-crypto/ecc/bn254/fr"
 	"github.com/hyperledger-labs/fabric-smart-client/pkg/utils/errors"
 )
@@ -91,23 +92,47 @@ func (f *fixedBases) gIdx() int          { return 2*f.n + 2 }
 func (f *fixedBases) hIdx() int          { return 2*f.n + 3 }
 func (f *fixedBases) sumLeftIdx() int    { return 2*f.n + 4 }
 
-type fixedBaseBuckets [1<<(fixedBaseWindow-1) + 1]bn254.G1Jac
+const (
+	fixedBaseBuckets = 1<<(fixedBaseWindow-1) + 1
+	// below this many pending additions a batch inversion no longer pays off
+	fixedBaseMinBatch = 16
+)
 
-var fixedBaseBucketPool = sync.Pool{New: func() any { return new(fixedBaseBuckets) }}
+// fixedBaseOp adds +-table[row][window] to bucket b.
+type fixedBaseOp struct {
+	row    uint32
+	window uint8
+	b      uint8
+	neg    bool
+}
+
+// fixedBaseState is the per-call scratch space of msm.
+type fixedBaseState struct {
+	pending, next, batch []fixedBaseOp
+	den, inv             []fp.Element
+	aff                  [fixedBaseBuckets]bn254.G1Affine
+	jac                  [fixedBaseBuckets]bn254.G1Jac
+	occupied, used       [fixedBaseBuckets]bool
+}
+
+var fixedBaseStatePool = sync.Pool{New: func() any { return new(fixedBaseState) }}
 
 // msm returns sum_i scalars[i]·base[idx[i]], using signed window digits in [-128, 128).
 // A scalar below 2^254 never carries past the last window.
+// Buckets are accumulated in affine form, one addition per bucket per batch, sharing
+// one field inversion per batch; additions with equal x and the tail go to Jacobian buckets.
 func (f *fixedBases) msm(idx []int, scalars []*mathlib.Zr) (*mathlib.G1, error) {
-	buckets := fixedBaseBucketPool.Get().(*fixedBaseBuckets)
-	defer fixedBaseBucketPool.Put(buckets)
-	*buckets = fixedBaseBuckets{}
+	st := fixedBaseStatePool.Get().(*fixedBaseState)
+	defer fixedBaseStatePool.Put(st)
+	st.jac = [fixedBaseBuckets]bn254.G1Jac{}
+	st.occupied = [fixedBaseBuckets]bool{}
 
+	pending := st.pending[:0]
 	var s fr.Element
-	var neg bn254.G1Affine
 	for i, z := range scalars {
 		math2.SetNativeFromZr[fr.Element, *fr.Element](z, &s)
 		limbs := s.Bits()
-		row := &f.table[idx[i]]
+		row := uint32(idx[i]) // #nosec G115 -- a table row index
 		carry := uint64(0)
 		for k := range fixedBaseWindows {
 			bit := k * fixedBaseWindow
@@ -116,21 +141,112 @@ func (f *fixedBases) msm(idx []int, scalars []*mathlib.Zr) (*mathlib.G1, error) 
 			if d >= 1<<(fixedBaseWindow-1) {
 				carry = 1
 				if d = 1<<fixedBaseWindow - d; d != 0 {
-					neg.Neg(&row[k])
-					buckets[d].AddMixed(&neg)
+					pending = append(pending, fixedBaseOp{row: row, window: uint8(k), b: uint8(d), neg: true})
 				}
 			} else if d != 0 {
-				buckets[d].AddMixed(&row[k])
+				pending = append(pending, fixedBaseOp{row: row, window: uint8(k), b: uint8(d)})
 			}
 		}
 	}
+
+	next := st.next[:0]
+	for len(pending) >= fixedBaseMinBatch {
+		st.used = [fixedBaseBuckets]bool{}
+		batch := st.batch[:0]
+		next = next[:0]
+		for _, op := range pending {
+			p := f.point(op)
+			switch {
+			case st.used[op.b]:
+				next = append(next, op)
+			case !st.occupied[op.b]:
+				st.used[op.b], st.occupied[op.b] = true, true
+				st.aff[op.b] = *p
+				if op.neg {
+					st.aff[op.b].Neg(p)
+				}
+			case st.aff[op.b].X.Equal(&p.X):
+				st.used[op.b] = true
+				addOp(&st.jac[op.b], p, op.neg)
+			default:
+				st.used[op.b] = true
+				batch = append(batch, op)
+			}
+		}
+		f.addAffineBatch(st, batch)
+		st.batch = batch
+		pending, next = next, pending
+	}
+	for _, op := range pending {
+		addOp(&st.jac[op.b], f.point(op), op.neg)
+	}
+	st.pending, st.next = pending, next
+
 	var running, total bn254.G1Jac
-	for d := len(buckets) - 1; d >= 1; d-- {
-		running.AddAssign(&buckets[d])
+	for d := fixedBaseBuckets - 1; d >= 1; d-- {
+		if st.occupied[d] {
+			running.AddMixed(&st.aff[d])
+		}
+		running.AddAssign(&st.jac[d])
 		total.AddAssign(&running)
 	}
 
 	return f.toG1(&total)
+}
+
+// addAffineBatch adds each op's point into its affine bucket; buckets are distinct and
+// no op shares its bucket's x, so every denominator is non-zero.
+func (f *fixedBases) addAffineBatch(st *fixedBaseState, batch []fixedBaseOp) {
+	n := len(batch)
+	if cap(st.den) < n {
+		st.den, st.inv = make([]fp.Element, n), make([]fp.Element, n)
+	}
+	den, inv := st.den[:n], st.inv[:n]
+	var acc fp.Element
+	acc.SetOne()
+	for j, op := range batch {
+		den[j].Sub(&f.point(op).X, &st.aff[op.b].X)
+		inv[j] = acc
+		acc.Mul(&acc, &den[j])
+	}
+	acc.Inverse(&acc)
+	for j := n - 1; j >= 0; j-- {
+		inv[j].Mul(&inv[j], &acc)
+		acc.Mul(&acc, &den[j])
+	}
+	var y2, lambda, x3, t fp.Element
+	for j, op := range batch {
+		p := f.point(op)
+		a := &st.aff[op.b]
+		y2 = p.Y
+		if op.neg {
+			y2.Neg(&y2)
+		}
+		lambda.Sub(&y2, &a.Y)
+		lambda.Mul(&lambda, &inv[j])
+		x3.Square(&lambda)
+		x3.Sub(&x3, &a.X)
+		x3.Sub(&x3, &p.X)
+		t.Sub(&a.X, &x3)
+		t.Mul(&t, &lambda)
+		t.Sub(&t, &a.Y)
+		a.X, a.Y = x3, t
+	}
+}
+
+func (f *fixedBases) point(op fixedBaseOp) *bn254.G1Affine {
+	return &f.table[op.row][op.window]
+}
+
+func addOp(acc *bn254.G1Jac, p *bn254.G1Affine, neg bool) {
+	if !neg {
+		acc.AddMixed(p)
+
+		return
+	}
+	var n bn254.G1Affine
+	n.Neg(p)
+	acc.AddMixed(&n)
 }
 
 // commitBits returns sum_i b_i·G_i + (b_i-1)·H_i + rho·P for the bits b_i of value.

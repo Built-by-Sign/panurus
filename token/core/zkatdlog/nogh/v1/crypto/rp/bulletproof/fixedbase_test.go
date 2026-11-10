@@ -70,6 +70,37 @@ func TestFixedBasesMSMMatchesGenericMSM(t *testing.T) {
 	require.True(t, s.curve.MultiScalarMul(points, scalars).Equals(got))
 }
 
+func TestFixedBasesMSMEdgeCases(t *testing.T) {
+	s := newFixedBaseSetup(t, 64, 6)
+	fb := s.bases(t)
+	rand, err := s.curve.Rand()
+	require.NoError(t, err)
+	all := append(append(append([]*math.G1{}, s.left...), s.right...), s.P, s.Q, s.pedersen[0], s.pedersen[1])
+	r := s.curve.NewRandomZr(rand)
+	negR := s.curve.ModNeg(r, s.curve.GroupOrder)
+
+	cases := map[string]struct {
+		idx     []int
+		scalars []*math.Zr
+	}{
+		// the same point lands twice in every bucket it touches: P + P
+		"same base, same scalar": {[]int{3, 3}, []*math.Zr{r, r}},
+		// every addition into a bucket meets its own negation: P + (-P)
+		"same base, opposite scalars": {[]int{5, 5}, []*math.Zr{r, negR}},
+		// fewer additions than one batch
+		"small scalar only": {[]int{7}, []*math.Zr{s.curve.NewZrFromUint64(300)}},
+	}
+	for name, c := range cases {
+		points := make([]*math.G1, len(c.idx))
+		for i, j := range c.idx {
+			points[i] = all[j]
+		}
+		got, err := fb.msm(c.idx, c.scalars)
+		require.NoError(t, err, name)
+		require.True(t, s.curve.MultiScalarMul(points, c.scalars).Equals(got), name)
+	}
+}
+
 func TestFixedBasesCommitBitsMatchesVectorCommitment(t *testing.T) {
 	s := newFixedBaseSetup(t, 64, 6)
 	fb := s.bases(t)
