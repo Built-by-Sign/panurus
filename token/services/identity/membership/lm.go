@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"slices"
 	"sync"
+	"time"
 	"unicode/utf8"
 
 	"github.com/LFDT-Panurus/panurus/token"
@@ -201,6 +202,8 @@ type LocalMembership struct {
 	targetIdentities          []view.Identity // optional list of identities to prefer
 	anonymous                 bool            // when true, only anonymous identities are considered selectable by default
 	closeOnce                 sync.Once
+	// misses, when enabled, skips the identity store for labels it recently did not know.
+	misses *missCache
 }
 
 // SetSignerRouter sets the router that local identities self-register with as they are loaded.
@@ -245,6 +248,7 @@ func NewLocalMembership(
 		KeyManagerProviders:       keyManagerProviders,
 		anonymous:                 defaultAnonymous,
 		IdentityProvider:          identityProvider,
+		misses:                    newMissCacheFromEnv(),
 	}
 }
 
@@ -770,6 +774,7 @@ func (l *LocalMembership) confIDFor(ctx context.Context, identityConfig *Identit
 }
 
 func (l *LocalMembership) registerIdentityConfiguration(ctx context.Context, identity *IdentityConfiguration, defaultIdentity bool) error {
+	defer l.misses.reset()
 	// Try to register the local identity
 	identity.URL = l.config.TranslatePath(identity.URL)
 	err1 := l.registerLocalIdentity(ctx, identity, defaultIdentity)
@@ -956,6 +961,10 @@ func (l *LocalMembership) refreshAndGet(ctx context.Context, label string) *Loca
 		return nil
 	}
 
+	if l.misses.hit(label, time.Now()) {
+		return nil
+	}
+
 	l.logger.DebugfContext(ctx, "refresh and get local identity for label [%s]", utils.Hashable(label))
 	configurations, err := l.identityDB.ConfigurationsByID(ctx, label, l.IdentityType)
 	if err != nil {
@@ -964,6 +973,8 @@ func (l *LocalMembership) refreshAndGet(ctx context.Context, label string) *Loca
 		return nil
 	}
 	if len(configurations) == 0 {
+		l.misses.add(label, time.Now())
+
 		return nil
 	}
 
