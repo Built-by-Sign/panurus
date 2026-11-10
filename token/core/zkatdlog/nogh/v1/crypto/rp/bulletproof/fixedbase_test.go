@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	math "github.com/IBM/mathlib"
+	"github.com/LFDT-Panurus/panurus/token/core/zkatdlog/nogh/v1/crypto/common"
 	"github.com/stretchr/testify/require"
 )
 
@@ -202,6 +203,46 @@ func TestRangeVerifierWithFixedBasesMatchesGeneric(t *testing.T) {
 		tamper(rpGeneric)
 		require.Error(t, verify(com, rpFixed, fb), name)
 		require.Error(t, verify(com, rpGeneric, nil), name)
+	}
+}
+
+func TestIPAProverFixedMatchesGeneric(t *testing.T) {
+	s := newFixedBaseSetup(t, 64, 6)
+	fb := s.bases(t)
+	rand, err := s.curve.Rand()
+	require.NoError(t, err)
+	vec := func() []*math.Zr {
+		v := make([]*math.Zr, s.bitLength)
+		for i := range v {
+			v[i] = s.curve.NewRandomZr(rand)
+		}
+
+		return v
+	}
+	left, right, weights := vec(), vec(), vec()
+	com := s.curve.GenG1.Mul(s.curve.NewRandomZr(rand))
+	ip := s.curve.NewRandomZr(rand)
+
+	for _, w := range [][]*math.Zr{nil, weights} {
+		prove := func(bases *fixedBases) *IPA {
+			tr := &common.Transcript{Curve: s.curve}
+			tr.InitHasherWithDomain(StandaloneIPATranscriptDomain)
+			p := NewIPAProver(ip, left, right, s.Q, s.left, s.right, com, s.rnds, s.curve, tr, nil)
+			p.rightWeights = w
+			p.bases = bases
+			proof, err := p.Prove()
+			require.NoError(t, err)
+
+			return proof
+		}
+		want, got := prove(nil), prove(fb)
+		require.True(t, want.Left.Equals(got.Left))
+		require.True(t, want.Right.Equals(got.Right))
+		require.Len(t, got.L, len(want.L))
+		for i := range want.L {
+			require.True(t, want.L[i].Equals(got.L[i]), "L[%d]", i)
+			require.True(t, want.R[i].Equals(got.R[i]), "R[%d]", i)
+		}
 	}
 }
 

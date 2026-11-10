@@ -245,14 +245,12 @@ func (p *ipaProver) rightWeighted(scalar *mathlib.Zr, i int) *mathlib.Zr {
 // of the left vector and right is a function of right vector.
 // Both vectors are committed in com which is passed as a parameter to reduce
 func (p *ipaProver) reduce(x0 *mathlib.Zr) (*mathlib.Zr, *mathlib.Zr, []*mathlib.G1, []*mathlib.G1, error) {
+	if p.bases != nil {
+		return p.reduceFixed(x0)
+	}
 	left := p.leftVector
 	right := p.rightVector
-	nGen := len(p.LeftGenerators)
-	// X = Q^x0; with a table, scalar·X is computed as (scalar·x0)·Q
-	var X *mathlib.G1
-	if p.bases == nil {
-		X = p.Q.Mul(x0)
-	}
+	X := p.Q.Mul(x0)
 
 	LArray := make([]*mathlib.G1, p.NumberOfRounds)
 	RArray := make([]*mathlib.G1, p.NumberOfRounds)
@@ -278,16 +276,12 @@ func (p *ipaProver) reduce(x0 *mathlib.Zr) (*mathlib.Zr, *mathlib.Zr, []*mathlib
 		pointsR := make([]*mathlib.G1, 0, len(p.LeftGenerators)+1)
 		scalarsR := make([]*mathlib.Zr, 0, len(p.LeftGenerators)+1)
 
-		baseIdxL := make([]int, 0, len(p.LeftGenerators)+1)
-		baseIdxR := make([]int, 0, len(p.LeftGenerators)+1)
-
 		for m := range 1 << i {
 			for j := range n_current {
 				idxG_R := j + (2*m+1)*n_current
 				idxH_L := j + 2*m*n_current
 
 				pointsL = append(pointsL, p.LeftGenerators[idxG_R], p.RightGenerators[idxH_L])
-				baseIdxL = append(baseIdxL, idxG_R, nGen+idxH_L)
 				scalarsL = append(scalarsL,
 					p.Curve.ModMul(left[j], s[m], p.Curve.GroupOrder),
 					p.rightWeighted(p.Curve.ModMul(right[n_current+j], sInv[m], p.Curve.GroupOrder), idxH_L),
@@ -297,7 +291,6 @@ func (p *ipaProver) reduce(x0 *mathlib.Zr) (*mathlib.Zr, *mathlib.Zr, []*mathlib
 				idxH_R := j + (2*m+1)*n_current
 
 				pointsR = append(pointsR, p.LeftGenerators[idxG_L], p.RightGenerators[idxH_R])
-				baseIdxR = append(baseIdxR, idxG_L, nGen+idxH_R)
 				scalarsR = append(scalarsR,
 					p.Curve.ModMul(left[n_current+j], s[m], p.Curve.GroupOrder),
 					p.rightWeighted(p.Curve.ModMul(right[j], sInv[m], p.Curve.GroupOrder), idxH_R),
@@ -305,26 +298,14 @@ func (p *ipaProver) reduce(x0 *mathlib.Zr) (*mathlib.Zr, *mathlib.Zr, []*mathlib
 			}
 		}
 
-		if p.bases != nil {
-			var err error
-			LArray[i], err = p.bases.msm(append(baseIdxL, p.bases.qIdx()), append(scalarsL, p.Curve.ModMul(x0, leftIP, p.Curve.GroupOrder)))
-			if err != nil {
-				return nil, nil, nil, nil, err
-			}
-			RArray[i], err = p.bases.msm(append(baseIdxR, p.bases.qIdx()), append(scalarsR, p.Curve.ModMul(x0, rightIP, p.Curve.GroupOrder)))
-			if err != nil {
-				return nil, nil, nil, nil, err
-			}
-		} else {
-			pointsL = append(pointsL, X)
-			scalarsL = append(scalarsL, leftIP)
+		pointsL = append(pointsL, X)
+		scalarsL = append(scalarsL, leftIP)
 
-			pointsR = append(pointsR, X)
-			scalarsR = append(scalarsR, rightIP)
+		pointsR = append(pointsR, X)
+		scalarsR = append(scalarsR, rightIP)
 
-			LArray[i] = p.Curve.MultiScalarMul(pointsL, scalarsL)
-			RArray[i] = p.Curve.MultiScalarMul(pointsR, scalarsR)
-		}
+		LArray[i] = p.Curve.MultiScalarMul(pointsL, scalarsL)
+		RArray[i] = p.Curve.MultiScalarMul(pointsR, scalarsR)
 
 		// compute this round's challenge x, chained through the same running transcript
 		// as the first challenge, so it is bound to every earlier round's (L, R) pair too

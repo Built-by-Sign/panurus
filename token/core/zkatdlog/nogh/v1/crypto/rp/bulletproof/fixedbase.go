@@ -122,16 +122,24 @@ var fixedBaseStatePool = sync.Pool{New: func() any { return new(fixedBaseState) 
 // Buckets are accumulated in affine form, one addition per bucket per batch, sharing
 // one field inversion per batch; additions with equal x and the tail go to Jacobian buckets.
 func (f *fixedBases) msm(idx []int, scalars []*mathlib.Zr) (*mathlib.G1, error) {
+	native := make([]fr.Element, len(scalars))
+	for i, z := range scalars {
+		math2.SetNativeFromZr[fr.Element, *fr.Element](z, &native[i])
+	}
+
+	return f.msmFr(idx, native)
+}
+
+// msmFr is msm over native scalars.
+func (f *fixedBases) msmFr(idx []int, scalars []fr.Element) (*mathlib.G1, error) {
 	st := fixedBaseStatePool.Get().(*fixedBaseState)
 	defer fixedBaseStatePool.Put(st)
 	st.jac = [fixedBaseBuckets]bn254.G1Jac{}
 	st.occupied = [fixedBaseBuckets]bool{}
 
 	pending := st.pending[:0]
-	var s fr.Element
-	for i, z := range scalars {
-		math2.SetNativeFromZr[fr.Element, *fr.Element](z, &s)
-		limbs := s.Bits()
+	for i := range scalars {
+		limbs := scalars[i].Bits()
 		row := uint32(idx[i]) // #nosec G115 -- a table row index
 		carry := uint64(0)
 		for k := range fixedBaseWindows {
