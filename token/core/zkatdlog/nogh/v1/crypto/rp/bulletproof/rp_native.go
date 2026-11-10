@@ -258,16 +258,28 @@ func nativeRPVerify[T any, E math2.GnarkFr[T]](v *rangeVerifier, rp *RangeProof,
 	E(&xSquareE).Mul(xE, xE)
 	xSquare := math2.NativeToZr[T, E](E(&xSquareE), v.Curve)
 
-	// com is should be equal to v.Commitment^{z^2} if p.Value falls within range
-	com := v.CommitmentGenerators[0].Mul(rp.Data.InnerProduct)
-	com.Add(v.CommitmentGenerators[1].Mul(rp.Data.Tau))
-	com.Sub(rp.Data.T1.Mul(x))
-	com.Sub(rp.Data.T2.Mul(xSquare))
+	if v.bases != nil {
+		// same check rearranged: G^(ip-polEval) H^tau == T1^x T2^(x^2) V^(z^2)
+		lhs, err := v.bases.pedersen(v.Curve.ModSub(rp.Data.InnerProduct, polEval, v.Curve.GroupOrder), rp.Data.Tau)
+		if err != nil {
+			return err
+		}
+		rhs := v.Curve.MultiScalarMul([]*math.G1{rp.Data.T1, rp.Data.T2, v.Commitment}, []*math.Zr{x, xSquare, zSquare})
+		if !lhs.Equals(rhs) {
+			return errors.New("invalid range proof")
+		}
+	} else {
+		// com is should be equal to v.Commitment^{z^2} if p.Value falls within range
+		com := v.CommitmentGenerators[0].Mul(rp.Data.InnerProduct)
+		com.Add(v.CommitmentGenerators[1].Mul(rp.Data.Tau))
+		com.Sub(rp.Data.T1.Mul(x))
+		com.Sub(rp.Data.T2.Mul(xSquare))
 
-	comPrime := v.Commitment.Mul2(zSquare, v.CommitmentGenerators[0], polEval)
+		comPrime := v.Commitment.Mul2(zSquare, v.CommitmentGenerators[0], polEval)
 
-	if !com.Equals(comPrime) {
-		return errors.New("invalid range proof")
+		if !com.Equals(comPrime) {
+			return errors.New("invalid range proof")
+		}
 	}
 
 	return nativeRPVerifyIPA[T, E](v, rp, xE, yPowE, zE, E(&zSquareE), tr)
@@ -323,31 +335,50 @@ func nativeRPVerifyIPA[T any, E math2.GnarkFr[T]](v *rangeVerifier, rp *RangePro
 	E(&deltaNegE).Sub(E(&deltaNegE), deltaE)
 	deltaNeg := math2.NativeToZr[T, E](E(&deltaNegE), v.Curve)
 
-	allPoints := make([]*math.G1, 0, 2*n+3)
-	allScalars := make([]*math.Zr, 0, 2*n+3)
-
 	x := math2.NativeToZr[T, E](xE, v.Curve)
 
-	allPoints = append(allPoints, rp.Data.D)
-	allScalars = append(allScalars, x)
+	var com *math.G1
+	if v.bases != nil {
+		// every left generator has scalar -z, so they collapse into one term on their sum
+		idx := make([]int, 0, n+2)
+		scalars := make([]*math.Zr, 0, n+2)
+		idx = append(idx, v.bases.sumLeftIdx(), v.bases.pIdx())
+		scalars = append(scalars, zNeg, deltaNeg)
+		for i := range n {
+			idx = append(idx, v.bases.rightIdx(i))
+			scalars = append(scalars, ziScalars[i])
+		}
+		var err error
+		if com, err = v.bases.msm(idx, scalars); err != nil {
+			return err
+		}
+		com.Add(rp.Data.D.Mul(x))
+		com.Add(rp.Data.C)
+	} else {
+		allPoints := make([]*math.G1, 0, 2*n+3)
+		allScalars := make([]*math.Zr, 0, 2*n+3)
 
-	allPoints = append(allPoints, rp.Data.C)
-	allScalars = append(allScalars, v.Curve.NewZrFromInt(1))
+		allPoints = append(allPoints, rp.Data.D)
+		allScalars = append(allScalars, x)
 
-	for i := range n {
-		allPoints = append(allPoints, v.LeftGenerators[i])
-		allScalars = append(allScalars, zNeg)
+		allPoints = append(allPoints, rp.Data.C)
+		allScalars = append(allScalars, v.Curve.NewZrFromInt(1))
+
+		for i := range n {
+			allPoints = append(allPoints, v.LeftGenerators[i])
+			allScalars = append(allScalars, zNeg)
+		}
+
+		for i := range n {
+			allPoints = append(allPoints, v.RightGenerators[i])
+			allScalars = append(allScalars, ziScalars[i])
+		}
+
+		allPoints = append(allPoints, v.P)
+		allScalars = append(allScalars, deltaNeg)
+
+		com = v.Curve.MultiScalarMul(allPoints, allScalars)
 	}
-
-	for i := range n {
-		allPoints = append(allPoints, v.RightGenerators[i])
-		allScalars = append(allScalars, ziScalars[i])
-	}
-
-	allPoints = append(allPoints, v.P)
-	allScalars = append(allScalars, deltaNeg)
-
-	com := v.Curve.MultiScalarMul(allPoints, allScalars)
 
 	ipv := NewIPAVerifier(
 		rp.Data.InnerProduct,
@@ -361,6 +392,7 @@ func nativeRPVerifyIPA[T any, E math2.GnarkFr[T]](v *rangeVerifier, rp *RangePro
 		v.Provider,
 	)
 	ipv.rightWeights = yInvZr
+	ipv.bases = v.bases
 
 	return ipv.Verify(rp.IPA)
 }

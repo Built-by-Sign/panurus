@@ -529,6 +529,8 @@ func (p *rangeProver) preprocess() ([]*math.Zr, []*math.Zr, *math.Zr, *RangeProo
 
 // rangeVerifier is an internal struct that manages the verification of a range proof.
 type rangeVerifier struct {
+	// bases, when set, computes the fixed-base parts of the checks from a precomputed table.
+	bases *fixedBases
 	// Commitment is the Pedersen commitment to be verified.
 	Commitment *math.G1
 	// CommitmentGenerators are the (G, H) generators.

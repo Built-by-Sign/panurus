@@ -230,6 +230,11 @@ func (v *RangeCorrectnessVerifier) Verify(rc *RangeCorrectness) error {
 		return errors.New("invalid range proof")
 	}
 
+	bases, err := fixedBasesFor(v.Curve, v.LeftGenerators, v.RightGenerators, v.P, v.Q, v.PedersenParameters)
+	if err != nil {
+		return err
+	}
+
 	n := len(rc.Proofs)
 	executor := v.Provider.New()
 	errs := make([]error, n)
@@ -255,6 +260,7 @@ func (v *RangeCorrectnessVerifier) Verify(rc *RangeCorrectness) error {
 				v.Provider,
 			)
 
+			bv.bases = bases
 			errs[i] = bv.Verify(rc.Proofs[i])
 		})
 	}

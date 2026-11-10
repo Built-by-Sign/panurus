@@ -351,6 +351,8 @@ func (p *ipaProver) reduce(x0 *mathlib.Zr) (*mathlib.Zr, *mathlib.Zr, []*mathlib
 
 // ipaVerifier manages the verification of an inner product argument proof.
 type ipaVerifier struct {
+	// bases, when set, computes the fixed-base part of the final check from a precomputed table.
+	bases *fixedBases
 	// rightWeights mirrors ipaProver.rightWeights.
 	rightWeights []*mathlib.Zr
 	// InnerProduct is the value being verified.
@@ -441,13 +443,8 @@ func (v *ipaVerifier) Verify(proof *IPA) error {
 	if err != nil {
 		return err
 	}
-	// C is commitment to leftVector, rightVector and their inner product
-	C := v.Q.Mul(v.Curve.ModMul(x, v.InnerProduct, v.Curve.GroupOrder))
-	C.Add(v.Commitment)
-
-	X := v.Q.Mul(x)
-
-	leftGen, rightGen := CloneGenerators(v.LeftGenerators, v.RightGenerators)
+	x0 := x
+	leftGen, rightGen := v.LeftGenerators, v.RightGenerators
 	xSquareList := make([]*mathlib.Zr, v.NumberOfRounds)
 	xSquareInvList := make([]*mathlib.Zr, v.NumberOfRounds)
 	xList := make([]*mathlib.Zr, v.NumberOfRounds)
@@ -496,6 +493,33 @@ func (v *ipaVerifier) Verify(proof *IPA) error {
 			sInv[i] = v.Curve.ModMul(sInv[i], v.rightWeights[i], v.Curve.GroupOrder)
 		}
 	}
+	if v.bases != nil {
+		// same check rearranged: G^s H^sInv Q^(x0(left*right-ip)) prod L^(-x^2) R^(-x^-2) == Commitment
+		baseIdx := make([]int, 0, 2*len(s)+1)
+		baseScalars := make([]*mathlib.Zr, 0, 2*len(s)+1)
+		for i := range s {
+			baseIdx = append(baseIdx, v.bases.leftIdx(i), v.bases.rightIdx(i))
+			baseScalars = append(baseScalars, s[i], sInv[i])
+		}
+		lr := v.Curve.ModMul(proof.Left, proof.Right, v.Curve.GroupOrder)
+		baseIdx = append(baseIdx, v.bases.qIdx())
+		baseScalars = append(baseScalars, v.Curve.ModMul(x0, v.Curve.ModSub(lr, v.InnerProduct, v.Curve.GroupOrder), v.Curve.GroupOrder))
+		lhs, err := v.bases.msm(baseIdx, baseScalars)
+		if err != nil {
+			return err
+		}
+		lhs.Add(v.Curve.MultiScalarMul(append(append([]*mathlib.G1{}, proof.L...), proof.R...), append(xSquareList, xSquareInvList...)))
+		if !lhs.Equals(v.Commitment) {
+			return errors.New("invalid IPA")
+		}
+
+		return nil
+	}
+	// C is commitment to leftVector, rightVector and their inner product
+	C := v.Q.Mul(v.Curve.ModMul(x0, v.InnerProduct, v.Curve.GroupOrder))
+	C.Add(v.Commitment)
+	X := v.Q.Mul(x0)
+
 	idx := 0
 	copy(generators[idx:], leftGen)
 	copy(scalars[idx:], s)

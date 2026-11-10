@@ -24,7 +24,7 @@ const (
 
 // fixedBases precomputes 2^(8k)·B for every range proof base B on BN254, so a
 // multi-scalar multiplication over them is a single bucket pass with no doublings.
-// Base order: left generators, right generators, P, Q, Pedersen G, Pedersen H.
+// Base order: left generators, right generators, P, Q, Pedersen G, Pedersen H, sum of left generators.
 type fixedBases struct {
 	n     int
 	table [][fixedBaseWindows]bn254.G1Affine
@@ -45,6 +45,11 @@ func fixedBasesFor(curve *mathlib.Curve, left, right []*mathlib.G1, P, Q *mathli
 	bases = append(bases, left...)
 	bases = append(bases, right...)
 	bases = append(bases, P, Q, pedersen[0], pedersen[1])
+	sumLeft := left[0].Copy()
+	for _, g := range left[1:] {
+		sumLeft.Add(g)
+	}
+	bases = append(bases, sumLeft)
 
 	h := sha256.New()
 	for _, b := range bases {
@@ -84,6 +89,7 @@ func (f *fixedBases) pIdx() int          { return 2 * f.n }
 func (f *fixedBases) qIdx() int          { return 2*f.n + 1 }
 func (f *fixedBases) gIdx() int          { return 2*f.n + 2 }
 func (f *fixedBases) hIdx() int          { return 2*f.n + 3 }
+func (f *fixedBases) sumLeftIdx() int    { return 2*f.n + 4 }
 
 type fixedBaseBuckets [1<<(fixedBaseWindow-1) + 1]bn254.G1Jac
 

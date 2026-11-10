@@ -118,6 +118,62 @@ func TestRangeCorrectnessWithFixedBasesVerifies(t *testing.T) {
 	require.Error(t, verifier.Verify(rc))
 }
 
+func TestRangeVerifierWithFixedBasesMatchesGeneric(t *testing.T) {
+	s := newFixedBaseSetup(t, 64, 6)
+	fb := s.bases(t)
+	rand, err := s.curve.Rand()
+	require.NoError(t, err)
+	value := ^uint64(0)
+	bf := s.curve.NewRandomZr(rand)
+	com := s.pedersen[0].Mul2(s.curve.NewZrFromUint64(value), s.pedersen[1], bf)
+	proof, err := NewRangeProver(com, value, s.pedersen, bf, s.left, s.right, s.P, s.Q, s.rnds, s.bitLength, s.curve, nil).Prove()
+	require.NoError(t, err)
+	raw, err := proof.Serialize()
+	require.NoError(t, err)
+
+	verify := func(com *math.G1, rp *RangeProof, bases *fixedBases) error {
+		v := NewRangeVerifier(com, s.pedersen, s.left, s.right, s.P, s.Q, s.rnds, s.bitLength, s.curve, nil)
+		v.bases = bases
+
+		return v.Verify(rp)
+	}
+	one := s.curve.NewZrFromUint64(1)
+	g := s.curve.GenG1
+	tampers := map[string]func(rp *RangeProof){
+		"tau":   func(rp *RangeProof) { rp.Data.Tau = s.curve.ModAdd(rp.Data.Tau, one, s.curve.GroupOrder) },
+		"delta": func(rp *RangeProof) { rp.Data.Delta = s.curve.ModAdd(rp.Data.Delta, one, s.curve.GroupOrder) },
+		"innerProduct": func(rp *RangeProof) {
+			rp.Data.InnerProduct = s.curve.ModAdd(rp.Data.InnerProduct, one, s.curve.GroupOrder)
+		},
+		"T1":       func(rp *RangeProof) { rp.Data.T1.Add(g) },
+		"C":        func(rp *RangeProof) { rp.Data.C.Add(g) },
+		"D":        func(rp *RangeProof) { rp.Data.D.Add(g) },
+		"ipaLeft":  func(rp *RangeProof) { rp.IPA.Left = s.curve.ModAdd(rp.IPA.Left, one, s.curve.GroupOrder) },
+		"ipaRight": func(rp *RangeProof) { rp.IPA.Right = s.curve.ModAdd(rp.IPA.Right, one, s.curve.GroupOrder) },
+		"ipaL0":    func(rp *RangeProof) { rp.IPA.L[0].Add(g) },
+		"ipaR5":    func(rp *RangeProof) { rp.IPA.R[5].Add(g) },
+	}
+	fresh := func() *RangeProof {
+		rp := &RangeProof{}
+		require.NoError(t, rp.Deserialize(raw))
+
+		return rp
+	}
+
+	require.NoError(t, verify(com, fresh(), fb))
+	require.NoError(t, verify(com, fresh(), nil))
+	other := com.Copy()
+	other.Add(s.pedersen[0])
+	require.Error(t, verify(other, fresh(), fb))
+	for name, tamper := range tampers {
+		rpFixed, rpGeneric := fresh(), fresh()
+		tamper(rpFixed)
+		tamper(rpGeneric)
+		require.Error(t, verify(com, rpFixed, fb), name)
+		require.Error(t, verify(com, rpGeneric, nil), name)
+	}
+}
+
 func TestFixedBasesOnlyForBN254(t *testing.T) {
 	curve := math.Curves[math.BLS12_381_BBS_GURVY]
 	g := curve.GenG1
@@ -144,6 +200,32 @@ func BenchmarkRangeProverFixedBases(b *testing.B) {
 				p := NewRangeProver(com, value, s.pedersen, bf, s.left, s.right, s.P, s.Q, s.rnds, s.bitLength, s.curve, nil)
 				p.bases = tc.bases
 				if _, err := p.Prove(); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkRangeVerifierFixedBases(b *testing.B) {
+	t := &testing.T{}
+	s := newFixedBaseSetup(t, 64, 6)
+	rand, _ := s.curve.Rand()
+	bf := s.curve.NewRandomZr(rand)
+	value := uint64(1_000_000_000)
+	com := s.pedersen[0].Mul2(s.curve.NewZrFromUint64(value), s.pedersen[1], bf)
+	proof, _ := NewRangeProver(com, value, s.pedersen, bf, s.left, s.right, s.P, s.Q, s.rnds, s.bitLength, s.curve, nil).Prove()
+	fb, _ := fixedBasesFor(s.curve, s.left, s.right, s.P, s.Q, s.pedersen)
+
+	for _, tc := range []struct {
+		name  string
+		bases *fixedBases
+	}{{"generic", nil}, {"fixed", fb}} {
+		b.Run(tc.name, func(b *testing.B) {
+			for range b.N {
+				v := NewRangeVerifier(com, s.pedersen, s.left, s.right, s.P, s.Q, s.rnds, s.bitLength, s.curve, nil)
+				v.bases = tc.bases
+				if err := v.Verify(proof); err != nil {
 					b.Fatal(err)
 				}
 			}
