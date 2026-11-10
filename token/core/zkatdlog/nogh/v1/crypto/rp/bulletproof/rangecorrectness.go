@@ -131,6 +131,11 @@ func (p *RangeCorrectnessProver) Prove() (*RangeCorrectness, error) {
 		Proofs: make([]*RangeProof, n),
 	}
 
+	bases, err := fixedBasesFor(p.Curve, p.LeftGenerators, p.RightGenerators, p.P, p.Q, p.PedersenParameters)
+	if err != nil {
+		return nil, err
+	}
+
 	// Executor controls execution strategy (serial or parallel)
 	executor := p.Provider.New()
 	errs := make([]error, n)
@@ -151,6 +156,7 @@ func (p *RangeCorrectnessProver) Prove() (*RangeCorrectness, error) {
 				p.Curve,
 				p.Provider,
 			)
+			bp.bases = bases
 			rc.Proofs[i], errs[i] = bp.Prove()
 		})
 	}

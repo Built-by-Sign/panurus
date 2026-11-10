@@ -129,6 +129,8 @@ const maxIPARounds = 16
 
 // ipaProver manages the creation of an inner product argument proof.
 type ipaProver struct {
+	// bases, when set, computes the multi-scalar multiplications from a precomputed table.
+	bases *fixedBases
 	// rightWeights, when set, scales the right basis: the effective generator i is
 	// RightGenerators[i]^rightWeights[i]. The transcript absorbs the unweighted
 	// generators, so the weights must be bound by the transcript already.
@@ -220,14 +222,9 @@ func (p *ipaProver) Prove() (*IPA, error) {
 		return nil, err
 	}
 
-	// compute a commitment to inner product value and the vectors
-	C := p.Q.Mul(p.Curve.ModMul(x, p.InnerProduct, p.Curve.GroupOrder))
-	C.Add(p.Commitment)
-
-	X := p.Q.Mul(x)
 	// reduce the left and right vectors into one value each, left and right
 	// LArray and RArray contain commitments to intermediate vectors
-	left, right, LArray, RArray, err := p.reduce(X, C)
+	left, right, LArray, RArray, err := p.reduce(x)
 	if err != nil {
 		return nil, err
 	}
@@ -240,15 +237,22 @@ func (p *ipaProver) rightWeighted(scalar *mathlib.Zr, i int) *mathlib.Zr {
 	if p.rightWeights == nil {
 		return scalar
 	}
+
 	return p.Curve.ModMul(scalar, p.rightWeights[i], p.Curve.GroupOrder)
 }
 
 // reduce returns two values left and right such that left is a function
 // of the left vector and right is a function of right vector.
 // Both vectors are committed in com which is passed as a parameter to reduce
-func (p *ipaProver) reduce(X, com *mathlib.G1) (*mathlib.Zr, *mathlib.Zr, []*mathlib.G1, []*mathlib.G1, error) {
+func (p *ipaProver) reduce(x0 *mathlib.Zr) (*mathlib.Zr, *mathlib.Zr, []*mathlib.G1, []*mathlib.G1, error) {
 	left := p.leftVector
 	right := p.rightVector
+	nGen := len(p.LeftGenerators)
+	// X = Q^x0; with a table, scalar·X is computed as (scalar·x0)·Q
+	var X *mathlib.G1
+	if p.bases == nil {
+		X = p.Q.Mul(x0)
+	}
 
 	LArray := make([]*mathlib.G1, p.NumberOfRounds)
 	RArray := make([]*mathlib.G1, p.NumberOfRounds)
@@ -274,12 +278,16 @@ func (p *ipaProver) reduce(X, com *mathlib.G1) (*mathlib.Zr, *mathlib.Zr, []*mat
 		pointsR := make([]*mathlib.G1, 0, len(p.LeftGenerators)+1)
 		scalarsR := make([]*mathlib.Zr, 0, len(p.LeftGenerators)+1)
 
+		baseIdxL := make([]int, 0, len(p.LeftGenerators)+1)
+		baseIdxR := make([]int, 0, len(p.LeftGenerators)+1)
+
 		for m := range 1 << i {
 			for j := range n_current {
 				idxG_R := j + (2*m+1)*n_current
 				idxH_L := j + 2*m*n_current
 
 				pointsL = append(pointsL, p.LeftGenerators[idxG_R], p.RightGenerators[idxH_L])
+				baseIdxL = append(baseIdxL, idxG_R, nGen+idxH_L)
 				scalarsL = append(scalarsL,
 					p.Curve.ModMul(left[j], s[m], p.Curve.GroupOrder),
 					p.rightWeighted(p.Curve.ModMul(right[n_current+j], sInv[m], p.Curve.GroupOrder), idxH_L),
@@ -289,6 +297,7 @@ func (p *ipaProver) reduce(X, com *mathlib.G1) (*mathlib.Zr, *mathlib.Zr, []*mat
 				idxH_R := j + (2*m+1)*n_current
 
 				pointsR = append(pointsR, p.LeftGenerators[idxG_L], p.RightGenerators[idxH_R])
+				baseIdxR = append(baseIdxR, idxG_L, nGen+idxH_R)
 				scalarsR = append(scalarsR,
 					p.Curve.ModMul(left[n_current+j], s[m], p.Curve.GroupOrder),
 					p.rightWeighted(p.Curve.ModMul(right[j], sInv[m], p.Curve.GroupOrder), idxH_R),
@@ -296,14 +305,26 @@ func (p *ipaProver) reduce(X, com *mathlib.G1) (*mathlib.Zr, *mathlib.Zr, []*mat
 			}
 		}
 
-		pointsL = append(pointsL, X)
-		scalarsL = append(scalarsL, leftIP)
+		if p.bases != nil {
+			var err error
+			LArray[i], err = p.bases.msm(append(baseIdxL, p.bases.qIdx()), append(scalarsL, p.Curve.ModMul(x0, leftIP, p.Curve.GroupOrder)))
+			if err != nil {
+				return nil, nil, nil, nil, err
+			}
+			RArray[i], err = p.bases.msm(append(baseIdxR, p.bases.qIdx()), append(scalarsR, p.Curve.ModMul(x0, rightIP, p.Curve.GroupOrder)))
+			if err != nil {
+				return nil, nil, nil, nil, err
+			}
+		} else {
+			pointsL = append(pointsL, X)
+			scalarsL = append(scalarsL, leftIP)
 
-		pointsR = append(pointsR, X)
-		scalarsR = append(scalarsR, rightIP)
+			pointsR = append(pointsR, X)
+			scalarsR = append(scalarsR, rightIP)
 
-		LArray[i] = p.Curve.MultiScalarMul(pointsL, scalarsL)
-		RArray[i] = p.Curve.MultiScalarMul(pointsR, scalarsR)
+			LArray[i] = p.Curve.MultiScalarMul(pointsL, scalarsL)
+			RArray[i] = p.Curve.MultiScalarMul(pointsR, scalarsR)
+		}
 
 		// compute this round's challenge x, chained through the same running transcript
 		// as the first challenge, so it is bound to every earlier round's (L, R) pair too
@@ -323,16 +344,6 @@ func (p *ipaProver) reduce(X, com *mathlib.G1) (*mathlib.Zr, *mathlib.Zr, []*mat
 
 		// reduce the vectors by 1/2, a function of the old vectors and x and 1/x
 		left, right = reduceVectors(left, right, x, xInv, p.Curve)
-
-		xSquare := p.Curve.ModMul(x, x, p.Curve.GroupOrder)
-		xSquareInv := xSquare.Copy()
-		xSquareInv.InvModOrder()
-
-		// compute the commitment to left, right and their inner product
-		CPrime := LArray[i].Mul2(xSquare, RArray[i], xSquareInv)
-		CPrime.Add(com)
-		// com = L^{x^2}*com*R^{1/x^2}
-		com = CPrime
 	}
 
 	return left[0], right[0], LArray, RArray, nil

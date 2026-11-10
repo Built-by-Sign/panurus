@@ -102,7 +102,10 @@ func nativeRPPreprocess[T any, E math2.GnarkFr[T]](
 	t1 := math2.NativeToZr[T, E](E(&t1E), p.Curve)
 
 	tau1 := p.Curve.NewRandomZr(randReader)
-	T1 := p.CommitmentGenerators[0].Mul2(t1, p.CommitmentGenerators[1], tau1)
+	T1, err := p.commitPedersen(t1, tau1)
+	if err != nil {
+		return nil, nil, nil, nil, nil, err
+	}
 
 	var t2E T
 	E(&t2E).SetZero()
@@ -116,7 +119,10 @@ func nativeRPPreprocess[T any, E math2.GnarkFr[T]](
 	t2 := math2.NativeToZr[T, E](E(&t2E), p.Curve)
 
 	tau2 := p.Curve.NewRandomZr(randReader)
-	T2 := p.CommitmentGenerators[0].Mul2(t2, p.CommitmentGenerators[1], tau2)
+	T2, err := p.commitPedersen(t2, tau2)
+	if err != nil {
+		return nil, nil, nil, nil, nil, err
+	}
 
 	tr.Absorb(T1.Bytes())
 	tr.Absorb(T2.Bytes())

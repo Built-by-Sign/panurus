@@ -210,6 +210,8 @@ func (p *RangeProof) Validate(curve math.CurveID) error {
 
 // rangeProver is an internal struct that manages the creation of a range proof.
 type rangeProver struct {
+	// bases, when set, computes the multi-scalar multiplications from a precomputed table.
+	bases *fixedBases
 	// value is the committed value to be proven within range.
 	value uint64
 	// blindingFactor is the randomness used for the value commitment.
@@ -291,7 +293,14 @@ func (p *rangeProver) Prove() (*RangeProof, error) {
 		yInv2i = p.Curve.ModMul(yInv2i, yInv, p.Curve.GroupOrder)
 	}
 	// compute the commitment to left and right
-	com := CommitVector(left, weightedRight, p.LeftGenerators, p.RightGenerators, p.Curve)
+	var com *math.G1
+	if p.bases != nil {
+		if com, err = p.bases.commitVectors(left, weightedRight, nil); err != nil {
+			return nil, err
+		}
+	} else {
+		com = CommitVector(left, weightedRight, p.LeftGenerators, p.RightGenerators, p.Curve)
+	}
 	rp.Data.InnerProduct = math2.InnerProduct(left, right, p.Curve)
 	// produce the IPA, continuing the same transcript used for y, z, x, T1, T2 above so
 	// the IPA's own challenges are bound to the enclosing range proof's statement too.
@@ -309,12 +318,22 @@ func (p *rangeProver) Prove() (*RangeProof, error) {
 		p.Provider,
 	)
 	ipp.rightWeights = yInvPow
+	ipp.bases = p.bases
 	rp.IPA, err = ipp.Prove()
 	if err != nil {
 		return nil, err
 	}
 
 	return rp, nil
+}
+
+// commitPedersen returns a·G + b·H over the commitment generators.
+func (p *rangeProver) commitPedersen(a, b *math.Zr) (*math.G1, error) {
+	if p.bases != nil {
+		return p.bases.pedersen(a, b)
+	}
+
+	return p.CommitmentGenerators[0].Mul2(a, p.CommitmentGenerators[1], b), nil
 }
 
 // preprocess prepares data for the inner product argument. The returned *common.Transcript
@@ -349,14 +368,20 @@ func (p *rangeProver) preprocess() ([]*math.Zr, []*math.Zr, *math.Zr, *RangeProo
 	}
 
 	// C commits to L = (b_0, ..., b_{p.BitLength}) and R = (b_0 - 1 , ..., b_{p.BitLength} - 1)
-	C := CommitVectorPlusOne(left, right, p.LeftGenerators, p.RightGenerators, rho, p.P, p.Curve)
 	// C is a hiding commitment thanks to rho
-	// C.Add(p.P.Mul(rho))
-
-	// D commits two random vectors U and V
-	D := CommitVectorPlusOne(randomLeft, randomRight, p.LeftGenerators, p.RightGenerators, eta, p.P, p.Curve)
-	// D is a hiding commitment thanks to eta
-	// D.Add(p.P.Mul(eta))
+	// D commits two random vectors U and V; D is a hiding commitment thanks to eta
+	var C, D *math.G1
+	if p.bases != nil {
+		if C, err = p.bases.commitBits(p.value, rho); err != nil {
+			return nil, nil, nil, nil, nil, err
+		}
+		if D, err = p.bases.commitVectors(randomLeft, randomRight, eta); err != nil {
+			return nil, nil, nil, nil, nil, err
+		}
+	} else {
+		C = CommitVectorPlusOne(left, right, p.LeftGenerators, p.RightGenerators, rho, p.P, p.Curve)
+		D = CommitVectorPlusOne(randomLeft, randomRight, p.LeftGenerators, p.RightGenerators, eta, p.P, p.Curve)
+	}
 
 	// Bind y, z, and (later) x to a single running transcript that absorbs
 	// the public statement, the commitment, C, D and then T1, T2, so x cannot be chosen
@@ -442,13 +467,19 @@ func (p *rangeProver) preprocess() ([]*math.Zr, []*math.Zr, *math.Zr, *RangeProo
 
 	// commit to t1
 	tau1 := p.Curve.NewRandomZr(rand)
-	T1 := p.CommitmentGenerators[0].Mul2(t1, p.CommitmentGenerators[1], tau1)
+	T1, err := p.commitPedersen(t1, tau1)
+	if err != nil {
+		return nil, nil, nil, nil, nil, err
+	}
 
 	// compute = \sum y^iU_iV_i
 	t2 := math2.InnerProduct(randomLeft, randRightPrime, p.Curve)
 	// commit to t2
 	tau2 := p.Curve.NewRandomZr(rand)
-	T2 := p.CommitmentGenerators[0].Mul2(t2, p.CommitmentGenerators[1], tau2)
+	T2, err := p.commitPedersen(t2, tau2)
+	if err != nil {
+		return nil, nil, nil, nil, nil, err
+	}
 
 	// compute challenge x, bound to the same transcript as y and z
 	tr.Absorb(T1.Bytes())
