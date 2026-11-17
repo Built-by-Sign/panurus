@@ -41,6 +41,7 @@ func unconnectedDB(t *testing.T) *sql.DB {
 
 func startPostgres(t *testing.T) *sql.DB {
 	t.Helper()
+
 	return startPostgresWithConfig(t, postgres.DefaultConfig(postgres.WithDBName("test-locker")))
 }
 
@@ -87,7 +88,7 @@ func TestLocker_PrecreatedSchemaWithDMLOnlyRole(t *testing.T) {
 	runtimeCfg.User, runtimeCfg.Pass = "locker_runtime", "test-runtime"
 	runtimeDB, err := sql.Open("pgx", runtimeCfg.DataSource())
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = runtimeDB.Close() })
+	t.Cleanup(func() { assert.NoError(t, runtimeDB.Close()) })
 
 	ctx := t.Context()
 	first, err := lockerpostgres.New(runtimeDB, table, lockerpostgres.Config{Owner: "auditor-1"}, nil, lockerpostgres.WithPrecreatedSchema())

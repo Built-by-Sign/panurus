@@ -21,6 +21,7 @@ import (
 	q "github.com/LFDT-Panurus/panurus/token/services/storage/db/sql/query"
 	qcommon "github.com/LFDT-Panurus/panurus/token/services/storage/db/sql/query/common"
 	"github.com/LFDT-Panurus/panurus/token/services/storage/db/sql/query/cond"
+	"github.com/LFDT-Panurus/panurus/token/services/storage/db/sql/query/pagination"
 	"github.com/LFDT-Panurus/panurus/token/services/utils"
 	"github.com/hyperledger-labs/fabric-smart-client/pkg/utils/errors"
 )
@@ -108,14 +109,20 @@ func (p *Locker) checkSchema() error {
 	ctx, cancel := context.WithTimeout(context.Background(), schemaCheckTimeout)
 	defer cancel()
 
-	// #nosec G201 -- table name is the same configuration-derived identifier used for DDL.
-	query := fmt.Sprintf("SELECT eid, anchor, owner, expires_at FROM %s LIMIT 0", p.table)
-	rows, err := p.db.QueryContext(ctx, query)
+	query, args := q.Select().
+		FieldsByName("eid", "anchor", "owner", "expires_at").
+		From(q.Table(p.table)).
+		Paginated(pagination.Empty()).
+		FormatPaginated(p.ci, pgcond.NewPaginationInterpreter())
+	rows, err := p.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return err
 	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
 
-	return rows.Close()
+	return rows.Err()
 }
 
 // createSchema creates the lease table and its supporting indexes if they do

@@ -22,6 +22,7 @@ import (
 	fscconfig "github.com/hyperledger-labs/fabric-smart-client/platform/view/services/config"
 	"github.com/hyperledger-labs/fabric-smart-client/platform/view/services/storage/driver/common"
 	fscpostgres "github.com/hyperledger-labs/fabric-smart-client/platform/view/services/storage/driver/sql/postgres"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -66,13 +67,16 @@ token:
 
 	db, mock, err := sqlmock.New()
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = db.Close() })
-	mock.ExpectQuery(`^SELECT eid, anchor, owner, expires_at FROM [a-z0-9_]+ LIMIT 0$`).
+	t.Cleanup(func() {
+		assert.NoError(t, db.Close())
+		assert.NoError(t, mock.ExpectationsWereMet())
+	})
+	mock.ExpectQuery(`^SELECT eid, anchor, owner, expires_at FROM [a-z0-9_]+ LIMIT \$1$`).WithArgs(0).
 		WillReturnRows(sqlmock.NewRows([]string{"eid", "anchor", "owner", "expires_at"})).RowsWillBeClosed()
+	mock.ExpectClose()
 
 	drivers := multiplexed.NewDriver(cp, postgres.NewNamedDriver(cp, fixedDBProvider{db: db}, nil))
 	manager := auditdb.NewStoreServiceManager(tms.NewConfigServiceWrapper(tokenconfig.NewService(cp)), drivers, nil)
 	_, err = manager.StoreServiceByTMSId(token.TMSID{Network: "net", Channel: "channel", Namespace: "tok"})
 	require.NoError(t, err)
-	require.NoError(t, mock.ExpectationsWereMet())
 }
