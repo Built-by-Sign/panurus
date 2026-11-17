@@ -17,6 +17,7 @@ import (
 	"github.com/LFDT-Panurus/panurus/token/services/storage/auditdb/locker/id"
 	lockerpostgres "github.com/LFDT-Panurus/panurus/token/services/storage/auditdb/locker/postgres"
 	"github.com/hyperledger-labs/fabric-smart-client/platform/view/services/storage/driver/sql/postgres"
+	"github.com/jackc/pgx/v5/pgconn"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -40,7 +41,12 @@ func unconnectedDB(t *testing.T) *sql.DB {
 
 func startPostgres(t *testing.T) *sql.DB {
 	t.Helper()
-	cfg := postgres.DefaultConfig(postgres.WithDBName("test-locker"))
+
+	return startPostgresWithConfig(t, postgres.DefaultConfig(postgres.WithDBName("test-locker")))
+}
+
+func startPostgresWithConfig(t *testing.T, cfg *postgres.ContainerConfig) *sql.DB {
+	t.Helper()
 	terminate, _, err := postgres.StartPostgres(t.Context(), cfg, nil)
 	require.NoError(t, err)
 	t.Cleanup(terminate)
@@ -62,6 +68,51 @@ func newLocker(t *testing.T, db *sql.DB, table string, cfg lockerpostgres.Config
 	require.NoError(t, err)
 
 	return l
+}
+
+func TestLocker_PrecreatedSchemaWithDMLOnlyRole(t *testing.T) {
+	const table = "test_eid_leases_precreated"
+	const missingTable = "test_eid_leases_missing"
+	cfg := postgres.DefaultConfig(postgres.WithDBName("test-locker"))
+	admin := startPostgresWithConfig(t, cfg)
+	newLocker(t, admin, table, lockerpostgres.Config{Owner: "schema-owner"})
+	_, err := admin.ExecContext(t.Context(), `
+		CREATE ROLE locker_runtime LOGIN PASSWORD 'test-runtime';
+		REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+		GRANT USAGE ON SCHEMA public TO locker_runtime;
+		GRANT SELECT, INSERT, UPDATE, DELETE ON test_eid_leases_precreated TO locker_runtime;
+	`)
+	require.NoError(t, err)
+
+	runtimeCfg := *cfg.DbConfig
+	runtimeCfg.User, runtimeCfg.Pass = "locker_runtime", "test-runtime"
+	runtimeDB, err := sql.Open("pgx", runtimeCfg.DataSource())
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, runtimeDB.Close()) })
+
+	ctx := t.Context()
+	first, err := lockerpostgres.New(runtimeDB, table, lockerpostgres.Config{Owner: "auditor-1"}, nil, lockerpostgres.WithPrecreatedSchema())
+	require.NoError(t, err)
+	second, err := lockerpostgres.New(runtimeDB, table, lockerpostgres.Config{Owner: "auditor-2", AcquireDeadline: 100 * time.Millisecond}, nil, lockerpostgres.WithPrecreatedSchema())
+	require.NoError(t, err)
+	require.NoError(t, first.AcquireLocks(ctx, "request-1", "alice"))
+	t.Cleanup(func() { first.ReleaseLocks(ctx, "request-1") })
+	require.ErrorIs(t, second.AcquireLocks(ctx, "request-2", "alice"), errs.ErrLockAcquireTimeout)
+	first.ReleaseLocks(ctx, "request-1")
+	require.NoError(t, second.AcquireLocks(ctx, "request-2", "alice"))
+	second.ReleaseLocks(ctx, "request-2")
+
+	// The same role cannot run the automatic schema path, even on an existing table.
+	_, err = lockerpostgres.New(runtimeDB, table, lockerpostgres.Config{Owner: "auditor-1"}, nil)
+	var pgErr *pgconn.PgError
+	require.ErrorAs(t, err, &pgErr)
+	require.Equal(t, "42501", pgErr.Code) // insufficient_privilege
+
+	missing, err := lockerpostgres.New(runtimeDB, missingTable, lockerpostgres.Config{Owner: "auditor-1"}, nil, lockerpostgres.WithPrecreatedSchema())
+	require.Nil(t, missing)
+	require.ErrorContains(t, err, missingTable)
+	require.ErrorAs(t, err, &pgErr)
+	require.Equal(t, "42P01", pgErr.Code) // undefined_table, not a DDL permission error
 }
 
 func TestLocker_AcquireRelease(t *testing.T) {

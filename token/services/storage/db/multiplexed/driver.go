@@ -118,6 +118,17 @@ func (d Driver) NewAuditTransaction(name driver2.PersistenceName, params ...stri
 	return guard.WrapAuditTransaction(s, d.policy), nil
 }
 
+// ShouldSkipCreateTable reports whether the named persistence disables schema creation.
+// An empty name selects the default persistence, just as for the store constructors.
+func (d Driver) ShouldSkipCreateTable(name driver2.PersistenceName) (bool, error) {
+	var opts struct{ SkipCreateTable bool }
+	if err := d.config.UnmarshalDriverOpts(name, &opts); err != nil {
+		return false, errors.Wrapf(err, "failed to read skipCreateTable for persistence [%s]", name)
+	}
+
+	return opts.SkipCreateTable, nil
+}
+
 func (d Driver) NewOwnerTransaction(name driver2.PersistenceName, params ...string) (driver4.TokenTransactionStore, error) {
 	dr, err := d.getDriver(name)
 	if err != nil {

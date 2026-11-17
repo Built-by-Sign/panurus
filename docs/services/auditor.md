@@ -145,7 +145,7 @@ token:
 | `memory` | Single replica | Any |
 | `postgres` | Multi-replica | PostgreSQL only |
 
-The Postgres backend creates an `eid_leases` table (prefixed per TMS persistence settings) and uses lease rows with heartbeat renewal.
+The Postgres backend uses an `eid_leases` table (prefixed per TMS persistence settings) and renews leases with a heartbeat. It creates the table and indexes by default. If `fsc.persistences.<name>.opts.skipCreateTable` is true for the persistence selected by `token.tms.<name>.auditdb.persistence` (`default` when not set), the locker performs no DDL. Provision the lease table with its `eid` primary key and its `anchor` and `expires_at` indexes before starting the auditor. The locker checks the table and its required columns when it initializes; if the check fails, it returns an error naming the physical table.
 
 **Lease ownership:** each row is keyed by EID and carries the holding replica (`owner`) plus the request it was taken for (`anchor`). An acquisition may only take over an existing row when the lease has expired, or when the row is the same replica's lease for the *same* anchor — a re-acquisition, which just refreshes the deadline. Two different anchors therefore never hold the same EID at once, including two concurrent audits on a single replica; the second one is contended and retried until `acquireDeadline`.
 

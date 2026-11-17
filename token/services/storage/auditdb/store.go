@@ -71,7 +71,9 @@ func NewStoreServiceManager(cp db.ConfigService, drivers multiplexed.Driver, rep
 			lockerCfg := DefaultLockerConfig()
 			_ = cfg.UnmarshalKey("auditor.locker", &lockerCfg)
 
-			l, err := locker.NewFromConfig(lockerCfg, store, replicaID)
+			l, err := locker.NewFromConfigWithSchemaPolicy(lockerCfg, store, replicaID, func() (bool, error) {
+				return drivers.ShouldSkipCreateTable(persistenceName)
+			})
 			if err != nil {
 				return nil, errors.Wrapf(err, "failed to create auditor locker for tms [%s]", tmsID)
 			}

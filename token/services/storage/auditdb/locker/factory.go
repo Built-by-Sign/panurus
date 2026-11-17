@@ -26,8 +26,16 @@ type WriteDBProvider interface {
 // The postgres audit store must keep satisfying WriteDBProvider; both ends match dynamically.
 var _ WriteDBProvider = (*sqlpostgres.AuditTransactionStore)(nil)
 
-// NewFromConfig builds the appropriate Locker based on cfg.
+// NewFromConfig builds a Locker with the default schema creation policy.
 func NewFromConfig(cfg Config, store any, replicaID id.ReplicaIDProvider) (Locker, error) {
+	return NewFromConfigWithSchemaPolicy(cfg, store, replicaID, nil)
+}
+
+// NewFromConfigWithSchemaPolicy resolves the persistence's schema creation policy only for backends that use it.
+// A nil resolver keeps the backend's default behavior.
+func NewFromConfigWithSchemaPolicy(
+	cfg Config, store any, replicaID id.ReplicaIDProvider, shouldSkipCreateTable func() (bool, error),
+) (Locker, error) {
 	switch cfg.Backend {
 	case BackendPostgres:
 		dbp, ok := store.(WriteDBProvider)
@@ -39,11 +47,23 @@ func NewFromConfig(cfg Config, store any, replicaID id.ReplicaIDProvider) (Locke
 			return nil, errors.New("postgres locker backend requires an AuditTransactionStore")
 		}
 
+		var opts []lockerpostgres.Option
+		if shouldSkipCreateTable != nil {
+			skip, err := shouldSkipCreateTable()
+			if err != nil {
+				return nil, errors.Wrap(err, "failed to resolve locker schema creation policy")
+			}
+			if skip {
+				opts = append(opts, lockerpostgres.WithPrecreatedSchema())
+			}
+		}
+
 		return lockerpostgres.New(
 			dbp.WriteDB(),
 			ats.PrefixedTableName("eid_leases"),
 			cfg.Postgres,
 			replicaID,
+			opts...,
 		)
 	case BackendMemory, "":
 		return memory.NewWithConfig(cfg.Memory), nil

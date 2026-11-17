@@ -29,9 +29,15 @@ func TestNewFromConfig_MemoryBackends(t *testing.T) {
 	// keep working — the owner requirement is postgres-only
 	for _, backend := range []locker.Backend{locker.BackendMemory, ""} {
 		t.Run(string(backend), func(t *testing.T) {
-			l, err := locker.NewFromConfig(locker.Config{Backend: backend}, nil, stubReplicaID{id: ""})
+			var schemaPolicyResolved bool
+			l, err := locker.NewFromConfigWithSchemaPolicy(locker.Config{Backend: backend}, nil, stubReplicaID{id: ""}, func() (bool, error) {
+				schemaPolicyResolved = true
+
+				return true, nil
+			})
 			require.NoError(t, err)
 			assert.NotNil(t, l)
+			assert.False(t, schemaPolicyResolved, "memory locker does not depend on the persistence schema policy")
 		})
 	}
 }
