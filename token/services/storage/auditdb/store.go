@@ -16,6 +16,7 @@ import (
 	"github.com/LFDT-Panurus/panurus/token/services/logging"
 	"github.com/LFDT-Panurus/panurus/token/services/storage/auditdb/locker"
 	"github.com/LFDT-Panurus/panurus/token/services/storage/auditdb/locker/memory"
+	lockerpostgres "github.com/LFDT-Panurus/panurus/token/services/storage/auditdb/locker/postgres"
 	"github.com/LFDT-Panurus/panurus/token/services/storage/db"
 	"github.com/LFDT-Panurus/panurus/token/services/storage/db/common"
 	dbdriver "github.com/LFDT-Panurus/panurus/token/services/storage/db/driver"
@@ -71,7 +72,17 @@ func NewStoreServiceManager(cp db.ConfigService, drivers multiplexed.Driver, rep
 			lockerCfg := DefaultLockerConfig()
 			_ = cfg.UnmarshalKey("auditor.locker", &lockerCfg)
 
-			l, err := locker.NewFromConfig(lockerCfg, store, replicaID)
+			var postgresOpts []lockerpostgres.Option
+			if lockerCfg.Backend == locker.BackendPostgres {
+				skip, err := drivers.ShouldSkipCreateTable(persistenceName)
+				if err != nil {
+					return nil, errors.Wrapf(err, "failed to configure auditor locker for tms [%s]", tmsID)
+				}
+				if skip {
+					postgresOpts = append(postgresOpts, lockerpostgres.WithPrecreatedSchema())
+				}
+			}
+			l, err := locker.NewFromConfig(lockerCfg, store, replicaID, postgresOpts...)
 			if err != nil {
 				return nil, errors.Wrapf(err, "failed to create auditor locker for tms [%s]", tmsID)
 			}

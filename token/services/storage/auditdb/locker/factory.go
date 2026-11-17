@@ -26,8 +26,8 @@ type WriteDBProvider interface {
 // The postgres audit store must keep satisfying WriteDBProvider; both ends match dynamically.
 var _ WriteDBProvider = (*sqlpostgres.AuditTransactionStore)(nil)
 
-// NewFromConfig builds the appropriate Locker based on cfg.
-func NewFromConfig(cfg Config, store any, replicaID id.ReplicaIDProvider) (Locker, error) {
+// NewFromConfig builds the appropriate Locker based on cfg. Options apply only to the Postgres backend.
+func NewFromConfig(cfg Config, store any, replicaID id.ReplicaIDProvider, postgresOpts ...lockerpostgres.Option) (Locker, error) {
 	switch cfg.Backend {
 	case BackendPostgres:
 		dbp, ok := store.(WriteDBProvider)
@@ -44,6 +44,7 @@ func NewFromConfig(cfg Config, store any, replicaID id.ReplicaIDProvider) (Locke
 			ats.PrefixedTableName("eid_leases"),
 			cfg.Postgres,
 			replicaID,
+			postgresOpts...,
 		)
 	case BackendMemory, "":
 		return memory.NewWithConfig(cfg.Memory), nil

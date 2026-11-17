@@ -25,6 +25,8 @@ import (
 	"github.com/hyperledger-labs/fabric-smart-client/pkg/utils/errors"
 )
 
+const schemaCheckTimeout = 5 * time.Second
+
 var logger = logging.MustGetLogger()
 
 // Locker implements locker.Locker using a SQL lease table.
@@ -45,16 +47,29 @@ type lockSession struct {
 	cancel context.CancelFunc
 }
 
+type lockerOptions struct {
+	usePrecreatedSchema bool
+}
+
+// Option configures how a Postgres locker is constructed.
+type Option func(*lockerOptions)
+
+// WithPrecreatedSchema requires the lease table to be provisioned separately and disables DDL.
+func WithPrecreatedSchema() Option {
+	return func(o *lockerOptions) { o.usePrecreatedSchema = true }
+}
+
 // New creates a Postgres-backed distributed Locker.
-// The table is created if it does not exist. db must be a *sql.DB connected to Postgres.
+// The lease table is created if it does not exist, unless WithPrecreatedSchema is used.
+// db must be a *sql.DB connected to Postgres.
 //
 // cfg.Owner defaults to the identifier reported by replicaID (the FSC node ID in
 // production). It returns an error wrapping errs.ErrLockerOwnerRequired when the
 // resolved owner is empty or blank — including when replicaID is nil or reports
 // an empty ID — because an owner shared by several replicas disables mutual
-// exclusion across all of them. That check runs before the table is created, so
+// exclusion across all of them. That check runs before schema setup, so
 // a misconfigured node fails without touching the database.
-func New(db *sql.DB, table string, cfg Config, replicaID id.ReplicaIDProvider) (*Locker, error) {
+func New(db *sql.DB, table string, cfg Config, replicaID id.ReplicaIDProvider, opts ...Option) (*Locker, error) {
 	if db == nil {
 		return nil, errors.New("postgres locker requires a non-nil *sql.DB")
 	}
@@ -73,12 +88,34 @@ func New(db *sql.DB, table string, cfg Config, replicaID id.ReplicaIDProvider) (
 		ci:       pgcond.NewConditionInterpreter(),
 		sessions: make(map[string]*lockSession),
 	}
-	if err := l.createSchema(); err != nil {
+	var options lockerOptions
+	for _, opt := range opts {
+		opt(&options)
+	}
+	if options.usePrecreatedSchema {
+		if err := l.checkSchema(); err != nil {
+			return nil, errors.Wrapf(err, "failed to check precreated auditor EID lease table [%s]", table)
+		}
+	} else if err := l.createSchema(); err != nil {
 		return nil, err
 	}
 	logger.Infof("postgres auditor locker for table [%s] locking as owner [%s]", table, cfg.Owner)
 
 	return l, nil
+}
+
+func (p *Locker) checkSchema() error {
+	ctx, cancel := context.WithTimeout(context.Background(), schemaCheckTimeout)
+	defer cancel()
+
+	// #nosec G201 -- table name is the same configuration-derived identifier used for DDL.
+	query := fmt.Sprintf("SELECT eid, anchor, owner, expires_at FROM %s LIMIT 0", p.table)
+	rows, err := p.db.QueryContext(ctx, query)
+	if err != nil {
+		return err
+	}
+
+	return rows.Close()
 }
 
 // createSchema creates the lease table and its supporting indexes if they do
